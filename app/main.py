@@ -9,16 +9,37 @@ else: import fcntl as _file_lock
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query, Header, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
+import logging
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, func, inspect
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from openpyxl import load_workbook, Workbook
-from .database import Base, engine, get_db, DATA_DIR, BACKUP_DIR, IMPORT_BACKUP_DIR, DB_PATH, JSON_DB_PATH, SessionLocal, DATA_LOCK, _backup_path_notice, initialize_json_database
+from .database import Base, engine, get_db, DATA_DIR, BACKUP_DIR, IMPORT_BACKUP_DIR, DB_PATH, JSON_DB_PATH, SessionLocal, DATA_LOCK, _backup_path_notice, initialize_json_database, acquire_data_lock, release_data_lock, DatabaseBusyError, SLOW_LOCK_SECONDS
 from .models import Product, Movement, Customer, Supplier, BankAccount, AccountBalanceAdjustment, AppUser, BankTransaction, ServiceOrder, Order, OrderItem, PurchaseReceipt, Guarantee, GuaranteeOccurrence, FinancialEntry, ImportLog, Sale, SaleItem, ServicePart, ServiceOrderEvent
 from .services import backup_service
 from . import security
 
 _instance_lock_handle=None
+
+_lmf_logger=logging.getLogger('lmf')
+if not _lmf_logger.handlers:
+    _handler=logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+    _lmf_logger.addHandler(_handler)
+    _lmf_logger.setLevel(os.getenv('LMF_LOG_LEVEL','INFO').upper())
+    _lmf_logger.propagate=False
+api_logger=logging.getLogger('lmf.api')
+
+def _load_auth_user(user_id:int):
+    """Read the signed-in user in a worker thread so the event loop is never blocked by DATA_LOCK."""
+    acquired_at=acquire_data_lock('auth-middleware')
+    try:
+        with SessionLocal() as db:
+            user=db.get(AppUser,user_id)
+            return {'id':user.id,'username':user.username,'is_admin':user.is_admin,'active':user.active} if user else None
+    finally:
+        release_data_lock('auth-middleware',acquired_at)
 
 def _acquire_instance_lock():
     """Prevent multiple server processes from writing separate caches to one JSON file."""
@@ -100,14 +121,25 @@ async def require_localhost_and_auth(request:Request,call_next):
     if request.url.path.startswith('/api/') and request.url.path not in AUTH_PUBLIC_PATHS:
         session=security.read_session(request.cookies.get('lmf_session'))
         if not session: return JSONResponse({'detail':'Autenticação necessária.'},status_code=401)
-        with DATA_LOCK, SessionLocal() as db: user=db.get(AppUser,session['uid'])
-        if not user or not user.active: return JSONResponse({'detail':'Sessão inválida. Entre novamente.'},status_code=401)
+        try: user=await run_in_threadpool(_load_auth_user,session['uid'])
+        except DatabaseBusyError as error:
+            return JSONResponse({'detail':f'{error} Tente novamente em instantes.'},status_code=503)
+        if not user or not user['active']: return JSONResponse({'detail':'Sessão inválida. Entre novamente.'},status_code=401)
         if request.method not in ('GET','HEAD','OPTIONS') and not hmac.compare_digest(request.headers.get('X-CSRF-Token',''),session['csrf']):
             return JSONResponse({'detail':'Token CSRF ausente ou inválido.'},status_code=403)
-        request.state.user_id=user.id
-        request.state.username=user.username
-        request.state.is_admin=user.is_admin
-    return await call_next(request)
+        request.state.user_id=user['id']
+        request.state.username=user['username']
+        request.state.is_admin=user['is_admin']
+    started=time_module.monotonic()
+    try:
+        response=await call_next(request)
+    except Exception:
+        api_logger.exception('Falha ao processar %s %s após %.2fs',request.method,request.url.path,time_module.monotonic()-started)
+        raise
+    elapsed=time_module.monotonic()-started
+    if elapsed>=SLOW_LOCK_SECONDS:
+        api_logger.warning('Requisição lenta: %s %s respondeu %s em %.2fs',request.method,request.url.path,response.status_code,elapsed)
+    return response
 
 class AuthIn(BaseModel):
     username:str=Field(min_length=1,max_length=60)
