@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f3f7fc"><title>LMF Control</title>
+  <link rel="stylesheet" href="/static/style.css?v=20261028-0015">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><img class="brand-logo brand-logo-light" src="/static/img/lmf-logo-light.png" alt="LMF Informática"><img class="brand-logo brand-logo-dark" src="/static/img/lmf-logo-dark.png" alt="LMF Informática"></div>
+    <nav id="nav" aria-label="Navegação principal"></nav>
+    <div class="sidebar-foot"><b>LMF Informática</b><small>Sistema de Gestão · v1.0</small></div>
+  </aside>
+  <main>
+    <header class="topbar">
+      <label class="search-box"><span>⌕</span><input id="global-search" placeholder="Pesquisar no sistema..." aria-label="Pesquisar no sistema"><kbd>Ctrl + K</kbd></label>
+      <div class="top-actions"><span id="signed-in-user" hidden></span><button id="logout-btn" class="icon-button" aria-label="Sair" hidden onclick="logout()">Sair</button><button id="refresh" class="icon-button" aria-label="Atualizar">↻</button><button class="icon-button" aria-label="Notificações">♧<i class="notification-dot"></i></button><button id="theme-toggle" class="theme-toggle" aria-label="Mudar tema"><span class="sun">☼</span><span class="theme-track"><i></i></span><span class="moon">☾</span></button></div>
+    </header>
+    <section id="content" class="page-content"></section>
+  </main>
+  <dialog id="dialog"><form method="dialog"><button class="close">×</button></form><div id="form"></div></dialog>
+  <dialog id="auth-dialog"><div id="auth-form"></div></dialog>
+  <div id="toast" role="status"><span></span><button type="button" aria-label="Fechar aviso" onclick="document.querySelector('#toast').style.display='none'">×</button></div>
+  <script src="/static/app.js?v=20261028-0017"></script>
+</body>
+</html>
