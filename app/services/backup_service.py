@@ -12,7 +12,7 @@ import zipfile
 from ..database import (
     BACKUP_DIR, DATA_DIR, JSON_DB_PATH, IMPORT_BACKUP_DIR, DATA_LOCK, JSON_FORMAT,
     JSON_FORMAT_VERSION, JSON_SCHEMA_REVISION, _legacy_sqlite_export,
-    _read_json, reload_json_database,
+    _read_json, reload_json_database, acquire_data_lock, release_data_lock,
 )
 
 FORMAT_NAME = "lmf-control-json-backup"
@@ -289,8 +289,13 @@ def _restore_backup_locked(path: Path, required_revision: str | None = None) -> 
 
 
 def restore_backup(path: Path, required_revision: str | None = None) -> dict:
-    with DATA_LOCK:
+    # A restore must wait for in-flight requests, but never forever: if the lock
+    # cannot be acquired in time, DatabaseBusyError is raised and nothing changes.
+    acquired_at = acquire_data_lock("restore_backup")
+    try:
         return _restore_backup_locked(path, required_revision)
+    finally:
+        release_data_lock("restore_backup", acquired_at)
 
 
 def delete_backup(filename: str) -> None:

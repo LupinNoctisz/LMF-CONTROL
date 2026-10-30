@@ -49,6 +49,37 @@ Se a pasta Documentos não puder ser criada, os backups passam a usar `%LOCALAPP
 
 Para inicializar com Windows, crie um atalho de `iniciar_lmf.bat` na pasta `shell:startup`. A janela precisa permanecer em execução para os backups diários.
 
+## Migração do JSON para PostgreSQL / Supabase (script; o app ainda usa o JSON)
+
+`scripts/migrate_json_to_postgres.py` copia o banco JSON para tabelas relacionais (o mesmo esquema de `app/models.py`) em um PostgreSQL, inclusive o do Supabase. **Isso não troca o banco em uso pelo aplicativo**: o LMF Control continua lendo e gravando o JSON. O script serve para preparar, validar e carregar uma cópia relacional.
+
+Garantias do script:
+
+- o JSON de origem é aberto só para leitura e seu hash SHA-256 é conferido antes e depois;
+- sem `--apply` nada é gravado no destino (simulação), e o relatório mostra o que seria inserido;
+- só insere registros ausentes; nunca atualiza nem apaga. Linhas já existentes com conteúdo diferente são apenas relatadas;
+- tudo roda em uma única transação (se algo falhar, nada é gravado);
+- antes de gravar, uma cópia do JSON é salva, sem sobrescrever cópias anteriores (padrão: `data/backups/pre-migracao/`, ou `--backup-dir`);
+- depois de gravar, relê o destino e confere cada linha; colunas ou tabelas do JSON que o esquema não comporta são avisadas;
+- destinos `*.supabase.co`/`*.supabase.com` só recebem dados com `--apply --allow-remote`.
+
+Passo a passo recomendado (sempre em um banco de teste ou cópia antes do real):
+
+```
+python scripts/migrate_json_to_postgres.py --json CAMINHO\lmf_control.json --database-url "postgresql+psycopg://usuario:senha@host:5432/banco"
+python scripts/migrate_json_to_postgres.py --json CAMINHO\lmf_control.json --database-url "..." --apply --report relatorio.json
+```
+
+A URL também pode vir da variável `LMF_DATABASE_URL`. Código de saída: 0 = sucesso, 1 = erro (nada gravado), 2 = gravou, mas a validação encontrou diferenças. Valores monetários continuam como `Float` (precisão dupla), exatamente como no JSON; mudar para `NUMERIC` é uma decisão separada. Os testes (`tests/test_migration.py`) rodam em SQLite e, com `LMF_TEST_DATABASE_URL` apontando para um PostgreSQL **descartável**, também em PostgreSQL (o schema `public` desse banco é apagado a cada teste).
+
+## Validação de telefone/CPF e fotos das ordens de serviço
+
+- **Telefone e WhatsApp** (clientes e fornecedores): DDD + número, no máximo 11 dígitos (DDD + 9 dígitos). Letras são bloqueadas na digitação e recusadas pelo servidor. Também é aceito DDD + 8 dígitos (telefone fixo). Formato gravado: `(92) 9 9815-8767`.
+- **CPF** (cadastro de clientes): exatamente 11 números, gravado como `999.888.777-54`. Só o formato é conferido; os dígitos verificadores não são calculados. CNPJ (14 dígitos) deixa de ser aceito nesse campo.
+- Registros antigos fora do padrão continuam aparecendo nas listas; para editá-los é preciso corrigir o valor (o formulário avisa e não corta o dado em silêncio).
+- **Fotos da OS**: até 6 por ordem de serviço, JPEG, PNG ou WebP, até 8 MB cada. O tipo é conferido pelo conteúdo do arquivo. Ficam em `data/documentos/ordens-servico/<id da OS>/`, pasta já incluída nos backups e devolvida na restauração. Excluir a OS exclui as fotos. A tabela `service_order_photos` (migração `20261029_0006`) guarda só os metadados; o script de migração para PostgreSQL copia essas linhas, **mas não os arquivos de imagem**.
+- Avisos de erro ao salvar agora aparecem por cima do formulário aberto. Antes ficavam escondidos atrás dele, e a tela parecia travada.
+
 ## Testes
 
 Após instalar os requisitos: `python -m pytest`. Para iniciar manualmente: `python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`.

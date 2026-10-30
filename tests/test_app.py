@@ -349,3 +349,65 @@ def test_json_database_is_authoritative_after_reload():
         rows=c.get('/api/products').json()
         assert any(row['sku']==sku for row in rows)
         assert not LEGACY_SQLITE_PATH.exists()
+
+
+# --- Regressão: travamento ao trocar de aba / "Failed to fetch" -------------------------
+import pytest
+from fastapi import HTTPException
+from app import database as database_module
+
+TAB_ENDPOINTS=['/api/dashboard','/api/products','/api/sales','/api/service-orders','/api/guarantees','/api/orders','/api/suppliers','/api/finance','/api/accounts','/api/reports/summary','/api/backups']
+
+def test_database_dependency_releases_lock_when_request_raises():
+    dependency=get_db()
+    next(dependency)
+    with pytest.raises(RuntimeError):
+        dependency.throw(RuntimeError('falha simulada'))
+    assert not DATA_LOCK.locked()
+
+def test_database_dependency_gives_up_with_503_when_lock_is_stuck(monkeypatch):
+    monkeypatch.setattr(database_module,'DB_LOCK_TIMEOUT',0.2)
+    assert DATA_LOCK.acquire(timeout=1)
+    try:
+        dependency=get_db()
+        with pytest.raises(HTTPException) as caught:
+            next(dependency)
+        assert caught.value.status_code==503
+    finally:
+        DATA_LOCK.release()
+    dependency=get_db()
+    next(dependency)
+    dependency.close()
+    assert not DATA_LOCK.locked()
+
+def test_api_answers_503_instead_of_hanging_when_database_lock_is_stuck(monkeypatch):
+    with TestClient(app) as c:
+        authenticate(c)
+        monkeypatch.setattr(database_module,'DB_LOCK_TIMEOUT',0.2)
+        assert DATA_LOCK.acquire(timeout=1)
+        try:
+            response=c.get('/api/suppliers')
+        finally:
+            DATA_LOCK.release()
+        assert response.status_code==503
+        assert 'ocupado' in response.json()['detail']
+        assert c.get('/api/suppliers').status_code==200
+        assert not DATA_LOCK.locked()
+
+def test_switching_between_tabs_repeatedly_never_leaves_the_lock_held():
+    with TestClient(app) as c:
+        authenticate(c)
+        for _ in range(5):
+            for path in TAB_ENDPOINTS:
+                response=c.get(path)
+                assert response.status_code==200,(path,response.text)
+                assert not DATA_LOCK.locked(),path
+
+def test_concurrent_tab_requests_complete_without_deadlock():
+    with TestClient(app) as c:
+        authenticate(c)
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures=[executor.submit(lambda p=path:c.get(p).status_code) for path in TAB_ENDPOINTS*4]
+            codes=[future.result(timeout=60) for future in futures]
+        assert set(codes)=={200}
+        assert not DATA_LOCK.locked()

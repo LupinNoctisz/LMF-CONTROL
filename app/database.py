@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import shutil
 import sqlite3  # one-time migration and legacy-backup compatibility only
 import threading
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from fastapi import HTTPException
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -32,6 +35,56 @@ _json_lock = threading.RLock()
 # threads, so this lock must not have RLock's thread ownership requirement.
 DATA_LOCK = threading.Lock()
 _json_loaded = False
+
+logger = logging.getLogger("lmf.database")
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, default))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# Maximum time a request waits for the shared database lock before it fails with
+# a clear error instead of hanging forever. Keep it below the browser timeout.
+DB_LOCK_TIMEOUT = _float_env("LMF_DB_LOCK_TIMEOUT", 30.0)
+# Waits and holds longer than this are logged as warnings to locate slow operations.
+SLOW_LOCK_SECONDS = _float_env("LMF_SLOW_LOCK_SECONDS", 2.0)
+
+
+class DatabaseBusyError(RuntimeError):
+    """The shared database lock could not be acquired within the timeout."""
+
+
+def acquire_data_lock(owner: str, timeout: float | None = None) -> float:
+    """Acquire DATA_LOCK with a timeout and return the acquisition timestamp.
+
+    Never call this directly from `async def` code: it blocks the calling thread.
+    Run it in a worker thread (for example with run_in_threadpool).
+    """
+    wait = DB_LOCK_TIMEOUT if timeout is None else timeout
+    started = time.monotonic()
+    if not DATA_LOCK.acquire(timeout=wait):
+        logger.error("Banco ocupado: %s aguardou %.1fs pelo bloqueio e desistiu", owner, wait)
+        raise DatabaseBusyError(f"O banco de dados ficou ocupado por mais de {wait:.0f}s.")
+    acquired = time.monotonic()
+    if acquired - started >= SLOW_LOCK_SECONDS:
+        logger.warning("%s aguardou %.2fs pelo bloqueio do banco", owner, acquired - started)
+    return acquired
+
+
+def release_data_lock(owner: str, acquired_at: float) -> None:
+    """Release DATA_LOCK from any thread; never raises if it was already released."""
+    held = time.monotonic() - acquired_at
+    try:
+        DATA_LOCK.release()
+    except RuntimeError:
+        logger.error("%s tentou liberar o bloqueio do banco, mas ele já estava liberado", owner)
+        return
+    if held >= SLOW_LOCK_SECONDS:
+        logger.warning("%s manteve o bloqueio do banco por %.2fs", owner, held)
 
 _configured_backup_dir = os.getenv("LMF_BACKUP_DIR")
 _documents_backup_dir = Path(os.getenv("USERPROFILE", str(Path.home()))) / "Documents" / "LMF-Control" / "Backups"
@@ -229,16 +282,25 @@ def reload_json_database() -> None:
 def persist_json_after_commit(session):
     if session.info.get("skip_json_persist") or not _json_loaded:
         return
+    started = time.monotonic()
     _write_json_snapshot()
+    elapsed = time.monotonic() - started
+    if elapsed >= SLOW_LOCK_SECONDS:
+        logger.warning("Gravar o banco JSON levou %.2fs", elapsed)
 
 
 def get_db():
-    DATA_LOCK.acquire()
+    try:
+        acquired_at = acquire_data_lock("get_db")
+    except DatabaseBusyError as error:
+        raise HTTPException(503, f"{error} Tente novamente em instantes.") from error
     db = None
     try:
         db = SessionLocal()
         yield db
     finally:
-        if db is not None:
-            db.close()
-        DATA_LOCK.release()
+        try:
+            if db is not None:
+                db.close()
+        finally:
+            release_data_lock("get_db", acquired_at)
