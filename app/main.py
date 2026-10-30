@@ -13,12 +13,12 @@ from starlette.concurrency import run_in_threadpool
 import logging
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, func, inspect
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from openpyxl import load_workbook, Workbook
-from .database import Base, engine, get_db, DATA_DIR, BACKUP_DIR, IMPORT_BACKUP_DIR, DB_PATH, JSON_DB_PATH, SessionLocal, DATA_LOCK, _backup_path_notice, initialize_json_database, acquire_data_lock, release_data_lock, DatabaseBusyError, SLOW_LOCK_SECONDS
+from .database import Base, engine, get_db, DATA_DIR, BACKUP_DIR, IMPORT_BACKUP_DIR, DB_PATH, JSON_DB_PATH, SessionLocal, DATA_LOCK, _backup_path_notice, initialize_json_database, acquire_data_lock, release_data_lock, DatabaseBusyError, release_data_lock, DatabaseBusyError, SLOW_LOCK_SECONDS
 from .models import Product, Movement, Customer, Supplier, BankAccount, AccountBalanceAdjustment, AppUser, BankTransaction, ServiceOrder, Order, OrderItem, PurchaseReceipt, ServiceOrderPhoto, Guarantee, GuaranteeOccurrence, FinancialEntry, ImportLog, Sale, SaleItem, ServicePart, ServiceOrderEvent
 from .services import backup_service
-from . import security
+from . import security, authorization, guarantees as guarantee_rules
 from .validation import normalize_phone, normalize_cpf
 
 _instance_lock_handle=None
@@ -41,6 +41,15 @@ def _load_auth_user(user_id:int):
             return {'id':user.id,'username':user.username,'is_admin':user.is_admin,'active':user.active} if user else None
     finally:
         release_data_lock('auth-middleware',acquired_at)
+
+def _audit_outcome(request:Request,status_code:int,response=None):
+    """Se a requisição consumiu uma autorização administrativa, registra se a operação foi executada ou falhou.
+    Roda DEPOIS de a resposta sair: o bloqueio do banco só é liberado após o envio, então esperar por ele
+    antes de responder travaria a requisição (mesmo padrão do deadlock original)."""
+    operation=getattr(request.state,'audit_operation',None)
+    if not operation: return
+    args=(operation[0],operation[1],getattr(request.state,'user_id',None),getattr(request.state,'username',None),authorization.client_ip(request),status_code)
+    authorization.start_outcome_thread(*args)
 
 def _acquire_instance_lock():
     """Prevent multiple server processes from writing separate caches to one JSON file."""
@@ -101,8 +110,23 @@ async def lifespan(app):
                 try: backup_service.create_backup('automatico')
                 except Exception as error: backup_service.set_status('falhou',str(error))
     thread=threading.Thread(target=daily_backup,name='lmf-daily-backup',daemon=True); thread.start()
+    def guarantee_expiry():
+        # Expira garantias vencidas sem ninguém abrir a tela: ao iniciar, depois a cada 5 min e logo após a meia-noite.
+        while True:
+            acquired=None
+            try:
+                acquired=acquire_data_lock('expirar-garantias',timeout=10)
+                with SessionLocal() as session: guarantee_rules.expire_due_guarantees(session)
+            except DatabaseBusyError: pass
+            except Exception: logging.getLogger('lmf').exception('Falha ao expirar garantias')
+            finally:
+                if acquired is not None: release_data_lock('expirar-garantias',acquired)
+            now=datetime.now(); midnight=datetime.combine(now.date()+timedelta(days=1),time(0,0,5))
+            if stop.wait(min(300,max(1,(midnight-now).total_seconds()))): break
+    expiry_thread=threading.Thread(target=guarantee_expiry,name='lmf-guarantee-expiry',daemon=True); expiry_thread.start()
     yield
-    stop.set(); thread.join(timeout=2)
+    stop.set(); thread.join(timeout=2); expiry_thread.join(timeout=12)
+    authorization.drain_pending(10)  # não perder o registro do resultado de uma operação em andamento
     _release_instance_lock()
 
 app = FastAPI(title='LMF Control', version='1.0.0', lifespan=lifespan)
@@ -136,7 +160,9 @@ async def require_localhost_and_auth(request:Request,call_next):
         response=await call_next(request)
     except Exception:
         api_logger.exception('Falha ao processar %s %s após %.2fs',request.method,request.url.path,time_module.monotonic()-started)
+        _audit_outcome(request,500)
         raise
+    _audit_outcome(request,response.status_code,response)
     elapsed=time_module.monotonic()-started
     if elapsed>=SLOW_LOCK_SECONDS:
         api_logger.warning('Requisição lenta: %s %s respondeu %s em %.2fs',request.method,request.url.path,response.status_code,elapsed)
@@ -235,6 +261,22 @@ def auth_forgot_password(payload:PasswordRecoveryIn,request:Request,db:Session=D
     _recovery_attempts.pop(address,None)
     return {'status':'senha redefinida','message':'Senha redefinida. O novo código foi salvo no arquivo local de recuperação.','recovery_file':str(security.RECOVERY_CODE_PATH)}
 
+class OperationAuthorizationIn(BaseModel):
+    operation:str=Field(min_length=1,max_length=80)
+    target:str=Field(min_length=1,max_length=120)
+    password:SecretStr=Field(min_length=1,max_length=200)
+
+@app.post('/api/auth/authorize-operation')
+def auth_authorize_operation(payload:OperationAuthorizationIn,request:Request,response:Response,db:Session=Depends(get_db)):
+    """Valida a senha do administrador (no backend) e emite um token de uso único para UMA operação sobre UM alvo."""
+    response.headers['Cache-Control']='no-store'
+    return authorization.issue_authorization(db,request,payload.operation,payload.target,payload.password.get_secret_value())
+
+@app.get('/api/audit')
+def audit_history(request:Request,limit:int=Query(100,ge=1,le=500),outcome:str|None=None,db:Session=Depends(get_db)):
+    if not getattr(request.state,'is_admin',False): raise HTTPException(403,'Apenas o administrador pode consultar a auditoria.')
+    return authorization.list_audit(db,limit,outcome)
+
 @app.post('/api/auth/logout')
 def auth_logout(response:Response):
     response.delete_cookie('lmf_session',path='/')
@@ -285,6 +327,8 @@ class GuaranteeIn(BaseModel):
     model_config=ConfigDict(from_attributes=True)
     id:int|None=None
     customer_id:int; service_order_id:int|None=None; item:str=Field(min_length=1); guarantee_type:str='serviço'; starts_on:date; ends_on:date; duration_days:int|None=None; status:str='ativa'; conditions:str|None=None; notes:str|None=None
+class GuaranteeInput(GuaranteeIn):
+    ends_on:date|None=None  # o vencimento é calculado pelo servidor (início + 90 dias)
 class GuaranteeOccurrenceIn(BaseModel):
     issue:str=Field(min_length=2); resolution:str|None=None; status:Literal['aberta','em análise','resolvida']='aberta'
 class FinanceIn(BaseModel):
@@ -311,9 +355,10 @@ class SaleEditIn(BaseModel):
 class PurchaseReceiptIn(BaseModel):
     product_id:int; quantity:int=Field(gt=0); unit_cost:float=Field(default=0,ge=0)
 
-def crud_routes(path, model, schema, searchable=(), input_schema=None):
+def crud_routes(path, model, schema, searchable=(), input_schema=None, delete_guard=None, prepare=None, before_list=None):
     in_schema=input_schema or schema  # entrada pode ser mais rígida que a resposta
     def listing(q:str|None=None, db:Session=Depends(get_db)):
+        if before_list: before_list(db)
         query=db.query(model)
         if q and searchable: query=query.filter(or_(*[getattr(model,c).ilike(f'%{q}%') for c in searchable]))
         return query.order_by(model.id.desc()).limit(500).all()
@@ -321,6 +366,7 @@ def crud_routes(path, model, schema, searchable=(), input_schema=None):
     app.get(f'/api/{path}',response_model=list[schema])(listing)
     def create(payload:in_schema,db:Session=Depends(get_db)):
         values=payload.model_dump(exclude={'id','number'})
+        if prepare: prepare(values,None)
         if model is Order:
             year=date.today().year; prefix=f'LMF-PED-{year}-'
             last=db.query(Order).filter(Order.number.like(prefix+'%')).order_by(Order.id.desc()).first()
@@ -335,12 +381,15 @@ def crud_routes(path, model, schema, searchable=(), input_schema=None):
     def update(item_id:int,payload:in_schema,db:Session=Depends(get_db)):
         obj=db.get(model,item_id)
         if not obj: raise HTTPException(404,'Registro não encontrado')
-        for k,v in payload.model_dump(exclude={'id','number'}).items(): setattr(obj,k,v)
+        values=payload.model_dump(exclude={'id','number'})
+        if prepare: prepare(values,obj)
+        for k,v in values.items(): setattr(obj,k,v)
         db.commit(); db.refresh(obj); return obj
     update.__name__=f'update_{path.replace("-","_")}'
     app.put(f'/api/{path}/{{item_id}}',response_model=schema)(update)
-    def delete(item_id:int,confirm:bool=Query(False),db:Session=Depends(get_db)):
+    def delete(item_id:int,request:Request,confirm:bool=Query(False),db:Session=Depends(get_db)):
         if not confirm: raise HTTPException(400,'Confirme a exclusão do registro.')
+        if delete_guard: delete_guard(db,request,item_id)  # autorização administrativa, validada no backend
         obj=db.get(model,item_id)
         if not obj: raise HTTPException(404,'Registro não encontrado')
         db.delete(obj)
@@ -356,8 +405,8 @@ crud_routes('products',Product,ProductIn,('sku','internal_code','name','category
 crud_routes('customers',Customer,CustomerIn,('name','phone','document','email'),input_schema=CustomerInput)
 crud_routes('suppliers',Supplier,SupplierIn,('name','categories','contact','phone','whatsapp','email','website','notes'),input_schema=SupplierInput)
 crud_routes('orders',Order,OrderIn,('number','description','status'))
-crud_routes('guarantees',Guarantee,GuaranteeIn,('item','conditions'))
-crud_routes('finance',FinancialEntry,FinanceIn,('description','category','kind','status','reference','payment_method','external_id'))
+crud_routes('guarantees',Guarantee,GuaranteeIn,('item','conditions'),input_schema=GuaranteeInput,prepare=guarantee_rules.prepare_guarantee,before_list=guarantee_rules.expire_due_guarantees)
+crud_routes('finance',FinancialEntry,FinanceIn,('description','category','kind','status','reference','payment_method','external_id'),delete_guard=lambda db,request,item_id:authorization.require_authorization(db,request,'financeiro.lancamento.excluir',item_id))
 
 @app.get('/api/accounts')
 def list_accounts(db:Session=Depends(get_db)):
@@ -386,14 +435,16 @@ def update_account(item_id:int,payload:BankAccountIn,request:Request,db:Session=
     new_date=values['opening_balance_date'] if 'opening_balance_date' in payload.model_fields_set else old_date
     if values['opening_balance'] and new_date is None and values['opening_balance']!=old_balance: new_date=date.today()
     values['opening_balance_date']=new_date
+    if old_balance!=values['opening_balance'] or old_date!=new_date: authorization.require_authorization(db,request,'financeiro.conta.saldo_inicial.alterar',item_id)
     for key,value in values.items(): setattr(account,key,value)
     if old_balance!=account.opening_balance or old_date!=account.opening_balance_date:
         db.add(AccountBalanceAdjustment(bank_account_id=account.id,user_id=request.state.user_id,old_balance=old_balance,new_balance=account.opening_balance,old_reference_date=old_date,new_reference_date=account.opening_balance_date,action='alterado',reason='Alteração administrativa do saldo inicial'))
     db.commit(); db.refresh(account); return account
 
 @app.delete('/api/accounts/{item_id}')
-def delete_account(item_id:int,confirm:bool=Query(False),db:Session=Depends(get_db)):
+def delete_account(item_id:int,request:Request,confirm:bool=Query(False),db:Session=Depends(get_db)):
     if not confirm: raise HTTPException(400,'Confirme a exclusão da conta.')
+    authorization.require_authorization(db,request,'financeiro.conta.excluir',item_id)
     account=db.get(BankAccount,item_id)
     if not account: raise HTTPException(404,'Conta não encontrada')
     if _account_linked_transaction_count(db,item_id) or db.query(AccountBalanceAdjustment).filter_by(bank_account_id=item_id).count():
@@ -410,6 +461,7 @@ def remove_opening_balance(item_id:int,payload:RemoveOpeningBalanceIn,request:Re
     if payload.account_name_confirmation.strip()!=account.name: raise HTTPException(400,'Confirmação do nome da conta não corresponde.')
     linked=_account_linked_transaction_count(db,account.id)
     if linked and not payload.confirm_linked_transactions: raise HTTPException(409,f'Esta conta tem {linked} movimentação(ões) vinculada(s). Confirme essa etapa adicional para continuar.')
+    authorization.require_authorization(db,request,'financeiro.conta.saldo_inicial.remover',item_id)
     old_balance=account.opening_balance; old_date=account.opening_balance_date
     account.opening_balance=0; account.opening_balance_date=None
     db.add(AccountBalanceAdjustment(bank_account_id=account.id,user_id=request.state.user_id,old_balance=old_balance,new_balance=0,old_reference_date=old_date,new_reference_date=None,action='saldo inicial removido',reason='Remoção administrativa; movimentações históricas preservadas'))
@@ -474,9 +526,10 @@ def create_sale(payload:SaleIn,idempotency_key:str|None=Header(default=None,alia
     except Exception as e: db.rollback(); raise HTTPException(409,f'Venda não registrada: {e}')
 
 @app.post('/api/sales/{sale_id}/cancel')
-def cancel_sale(sale_id:int,db:Session=Depends(get_db)):
+def cancel_sale(sale_id:int,request:Request,db:Session=Depends(get_db)):
     sale=db.query(Sale).filter_by(id=sale_id).with_for_update().first()
     if not sale: raise HTTPException(404,'Venda não encontrada')
+    authorization.require_authorization(db,request,'financeiro.venda.cancelar',sale_id)
     if sale.status=='cancelada': return {'status':'cancelada','duplicate_request':True}
     try:
         if sale.status=='confirmada':
@@ -502,8 +555,9 @@ def update_sale(sale_id:int,payload:SaleEditIn,db:Session=Depends(get_db)):
     db.commit(); return {'updated':True,'id':sale_id}
 
 @app.delete('/api/sales/{sale_id}')
-def delete_sale(sale_id:int,confirm:bool=Query(False),db:Session=Depends(get_db)):
+def delete_sale(sale_id:int,request:Request,confirm:bool=Query(False),db:Session=Depends(get_db)):
     if not confirm: raise HTTPException(400,'Confirme a exclusão da venda.')
+    authorization.require_authorization(db,request,'financeiro.venda.excluir',sale_id)
     sale=db.get(Sale,sale_id)
     if not sale: raise HTTPException(404,'Venda não encontrada')
     try:
@@ -894,9 +948,10 @@ def backup():
 @app.get('/api/backups')
 def backups(): return {'items':backup_service.list_backups(),'importable':backup_service.importable_backups(),'paths':{'data':str(DATA_DIR),'database':str(DB_PATH),'backups':str(BACKUP_DIR),'import':str(IMPORT_BACKUP_DIR)},'backup_path_notice':_backup_path_notice,'settings':backup_service.read_settings(),'last_status':backup_service.last_status()}
 @app.post('/api/backups/{filename}/restore')
-def restore(filename:str,confirm:bool=Query(False)):
+def restore(filename:str,request:Request,confirm:bool=Query(False)):
     if not confirm: raise HTTPException(400,'Confirme a restauração com confirm=true')
     if Path(filename).name!=filename: raise HTTPException(404,'Backup não encontrado')
+    authorization.require_authorization_standalone(request,'backup.restaurar',filename)
     src=BACKUP_DIR/filename
     try: return backup_service.restore_backup(src,backup_service.schema_revision())
     except Exception as e: raise HTTPException(400,f'Falha na restauração: {e}')

@@ -34,6 +34,12 @@ def authenticate(client):
     assert response.status_code==200,response.text
     client.headers.update({'X-CSRF-Token':response.json()['csrf_token']})
 
+def authorize(client,operation,target):
+    """Passo de senha do administrador: devolve o cabeçalho de autorização de uso único."""
+    response=client.post('/api/auth/authorize-operation',json={'operation':operation,'target':str(target),'password':TEST_USER['password']})
+    assert response.status_code==200,response.text
+    return {'X-Operation-Authorization':response.json()['token']}
+
 def test_authentication_blocks_api_until_first_admin_login():
     with TestClient(app) as c:
         for route in ['/api/accounts','/api/finance','/api/backups']:
@@ -181,7 +187,7 @@ def test_excel_import_guarantee_finance_and_restore():
         fin=c.post('/api/finance',json={'kind':'receita','category':'serviço','description':'OS teste','amount':50,'reference':'OS-'+uuid4().hex})
         assert fin.status_code==200
         backup=c.post('/api/backups').json()['file']
-        assert c.post(f'/api/backups/{backup}/restore?confirm=true').status_code==200
+        assert c.post(f'/api/backups/{backup}/restore?confirm=true',headers=authorize(c,'backup.restaurar',backup)).status_code==200
 
 def test_real_stock_workbook_layout():
     filename='LMF_Controle_Produtos_Caixa (1).xlsx'
@@ -215,16 +221,16 @@ def test_sale_stock_finance_report_and_imported_backup():
         failed=c.post('/api/sales',json={'items':[{'product_id':product['id'],'quantity':3,'unit_price':20}],'received_amount':0})
         assert failed.status_code==409
         assert c.get('/api/products').json()[0]['quantity']==2
-        canceled=c.post(f"/api/sales/{sale.json()['id']}/cancel")
+        canceled=c.post(f"/api/sales/{sale.json()['id']}/cancel",headers=authorize(c,'financeiro.venda.cancelar',sale.json()['id']))
         assert canceled.status_code==200 and canceled.json()['refunded']==25
         assert c.get('/api/products').json()[0]['quantity']==4
-        assert c.post(f"/api/sales/{sale.json()['id']}/cancel").json()['duplicate_request'] is True
+        assert c.post(f"/api/sales/{sale.json()['id']}/cancel",headers=authorize(c,'financeiro.venda.cancelar',sale.json()['id'])).json()['duplicate_request'] is True
         backup=c.post('/api/backups').json()['file']
         IMPORT_BACKUP_DIR.mkdir(parents=True,exist_ok=True)
         imported_name='imported-'+backup
         shutil.copy2(BACKUP_DIR/backup,IMPORT_BACKUP_DIR/imported_name)
         assert c.post(f'/api/backups/import/{imported_name}').status_code==200
-        assert c.post(f'/api/backups/{imported_name}/restore?confirm=true').status_code==200
+        assert c.post(f'/api/backups/{imported_name}/restore?confirm=true',headers=authorize(c,'backup.restaurar',imported_name)).status_code==200
 
 def test_purchase_receipt_is_idempotent_and_updates_stock_only_on_receipt():
     with TestClient(app) as c:
@@ -259,7 +265,7 @@ def test_legacy_backup_is_migrated_before_restore():
         legacy_zip=os.path.abspath('work/json-auth-test-backups-6char/legacy-test.zip')
         with zipfile.ZipFile(legacy_zip,'w',zipfile.ZIP_DEFLATED) as z: z.write(legacy_db,'lmf.db')
         assert inspect_archive(__import__('pathlib').Path(legacy_zip))['integrity']=='íntegro'
-        restored=c.post('/api/backups/legacy-test.zip/restore?confirm=true')
+        restored=c.post('/api/backups/legacy-test.zip/restore?confirm=true',headers=authorize(c,'backup.restaurar','legacy-test.zip'))
         assert restored.status_code==200,restored.text
 
 def test_corrupt_backup_cannot_replace_live_database():
@@ -268,7 +274,7 @@ def test_corrupt_backup_cannot_replace_live_database():
         before=c.get('/api/products').json()
         bad=BACKUP_DIR/'corrupt-test.zip'
         bad.write_bytes(b'not a valid zip')
-        response=c.post('/api/backups/corrupt-test.zip/restore?confirm=true')
+        response=c.post('/api/backups/corrupt-test.zip/restore?confirm=true',headers=authorize(c,'backup.restaurar','corrupt-test.zip'))
         assert response.status_code==400
         assert c.get('/api/products').json()==before
         import json
@@ -291,7 +297,7 @@ def test_remove_opening_balance_preserves_financial_and_bank_movements():
         blocked=c.post(url,headers={'X-CSRF-Token':csrf},json=payload)
         assert blocked.status_code==409
         payload['confirm_linked_transactions']=True
-        removed=c.post(url,headers={'X-CSRF-Token':csrf},json=payload)
+        removed=c.post(url,headers={'X-CSRF-Token':csrf,**authorize(c,'financeiro.conta.saldo_inicial.remover',account['id'])},json=payload)
         assert removed.status_code==200 and removed.json()['balance']==100
         updated=next(a for a in c.get('/api/accounts').json() if a['id']==account['id'])
         assert updated['opening_balance']==0 and updated['opening_balance_date'] is None and updated['balance']==100
@@ -306,7 +312,7 @@ def test_remove_initial_balance_without_movements_and_no_balance():
         authenticate(c)
         account=c.post('/api/accounts',json={'name':'Conta sem movimentos '+uuid4().hex[:6],'opening_balance':75}).json()
         csrf=c.get('/api/auth/status').json()['csrf_token']
-        response=c.post(f"/api/accounts/{account['id']}/remove-opening-balance",headers={'X-CSRF-Token':csrf},json={'account_name_confirmation':account['name']})
+        response=c.post(f"/api/accounts/{account['id']}/remove-opening-balance",headers={'X-CSRF-Token':csrf,**authorize(c,'financeiro.conta.saldo_inicial.remover',account['id'])},json={'account_name_confirmation':account['name']})
         assert response.status_code==200 and response.json()['balance']==0
         assert c.post(f"/api/accounts/{account['id']}/remove-opening-balance",headers={'X-CSRF-Token':csrf},json={'account_name_confirmation':account['name']}).json()['status']=='sem saldo inicial'
 
