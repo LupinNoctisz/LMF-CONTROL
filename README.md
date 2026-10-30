@@ -37,6 +37,8 @@ Quando decidir preparar a integração:
 4. Para enviar uma cópia local, rode `python scripts/supabase_sync.py push`. Isso só ocorre por comando explícito.
 5. Para substituir o JSON local pela cópia remota, pare o servidor e rode `python scripts/supabase_sync.py pull --confirm-replace`. O comando valida o conteúdo e cria um backup local antes da substituição. Depois, reinicie o aplicativo.
 
+**Estado atual (opção B: o JSON continua sendo o banco principal; o Supabase é um espelho).** Em 30/10/2026 a tabela `public.lmf_json_state` foi criada no projeto **LMF CONTROL** (`wcubsqxxqadodaynothx`) pela migração `lmf_json_state_mirror`, com RLS ligado e acesso apenas para `service_role` (`anon` e `authenticated` não leem nem gravam). A tabela está **vazia**: nenhum dado foi enviado. Para o primeiro envio falta apenas você criar uma *secret key* em Project Settings > API Keys e colocá-la **somente no seu `.env` local** (`SUPABASE_SECRET_KEY`, `LMF_SUPABASE_SYNC_ENABLED=true`); depois rode `python scripts/supabase_sync.py status` e `push`. O envio e a leitura foram testados contra um servidor falso local e o formato da linha foi conferido na tabela remota; o envio real com a chave ainda não foi executado.
+
 O snapshot inclui os registros de usuários e hashes de senha/código de recuperação junto com os dados operacionais. Proteja o projeto e a secret key como dados administrativos. `pull` substitui o estado local inteiro; não combina alterações linha a linha. Resolva divergências antes de escolher qual lado enviar.
 
 ## Dados e backup
