@@ -948,12 +948,12 @@ def backup():
 @app.get('/api/backups')
 def backups(): return {'items':backup_service.list_backups(),'importable':backup_service.importable_backups(),'paths':{'data':str(DATA_DIR),'database':str(DB_PATH),'backups':str(BACKUP_DIR),'import':str(IMPORT_BACKUP_DIR)},'backup_path_notice':_backup_path_notice,'settings':backup_service.read_settings(),'last_status':backup_service.last_status()}
 @app.post('/api/backups/{filename}/restore')
-def restore(filename:str,request:Request,confirm:bool=Query(False)):
+def restore(filename:str,request:Request,confirm:bool=Query(False),allow_incomplete:bool=Query(False)):
     if not confirm: raise HTTPException(400,'Confirme a restauração com confirm=true')
     if Path(filename).name!=filename: raise HTTPException(404,'Backup não encontrado')
     authorization.require_authorization_standalone(request,'backup.restaurar',filename)
     src=BACKUP_DIR/filename
-    try: return backup_service.restore_backup(src,backup_service.schema_revision())
+    try: return backup_service.restore_backup(src,backup_service.schema_revision(),allow_incomplete)
     except Exception as e: raise HTTPException(400,f'Falha na restauração: {e}')
 
 @app.post('/api/backups/import/{filename}')

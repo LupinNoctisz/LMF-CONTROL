@@ -233,7 +233,7 @@ def test_photos_are_included_in_backups_and_restored(client):
     item = upload(client, order_id, [png('backup.png')]).json()['items'][0]
     archive = backup_service.create_backup('teste-fotos')
     with zipfile.ZipFile(archive) as z:
-        names = [n for n in z.namelist() if n.startswith(f'documents/ordens-servico/{order_id}/')]
+        names = [n for n in z.namelist() if n.startswith(f'documents/ordens-servico/{order_id}/') and not n.endswith('/')]
     assert len(names) == 1
     # simula perda do arquivo; a restauração devolve o arquivo e as linhas do banco
     for path in main_module._photo_dir(order_id).iterdir():
