@@ -100,3 +100,13 @@ A tela de venda registra um produto por operação; a API aceita vários itens. 
 **Garantias.** Duração de 90 dias contados a partir da data de início da garantia. O vencimento é calculado e gravado pelo servidor na criação (o valor enviado pelo navegador é ignorado; registros antigos mantêm o vencimento que já tinham). Uma tarefa em segundo plano (ao iniciar, a cada 5 minutos e após a meia-noite) muda o status para `expirada` sem ninguém abrir a tela; só o campo `status` é alterado, nunca documentos ou outros dados. O último dia (vencimento) ainda é válido.
 
 **Operações financeiras destrutivas.** Excluir lançamento/venda/conta, cancelar venda, remover/alterar saldo inicial e restaurar backup exigem a senha do administrador, validada somente no servidor: gera um token de uso único (120 s) preso ao usuário, à operação e ao item; 5 senhas erradas em 15 min bloqueiam o usuário; chamadas diretas à API sem token são recusadas; tudo é registrado em auditoria (`GET /api/audit`, tabela somente de inclusão + `audit.log`), sem gravar senha ou token.
+
+
+## Clientes, OS e validações (prompt mestre, etapa 1)
+
+- **CPF**: 11 dígitos com conferência dos dígitos verificadores (recusa 111.111.111-11 etc.); um CPF só pode existir em um cliente (409 ao duplicar).
+- **Número de série da OS**: exatamente 15 dígitos, gravado como texto (zeros à esquerda preservados), validado no backend em criação e atualização. Mensagem: "Número de série incorreto. O número de série deve conter exatamente 15 dígitos." OS antigas não são alteradas.
+- **Tipo de equipamento** obrigatório na OS (Celular, Computador, Notebook, Videogame), pesquisável (`?q=`) e filtrável (`?equipment_type=`).
+- **Cliente dentro da OS**: informe o CPF; se existir, o cadastro é reaproveitado e preenchido (`GET /api/customers/lookup?document=`); senão é criado ao salvar a OS. A aba de clientes não é necessária.
+- **Identificador público do cliente** (`public_seq`, exibido 01, 02, ... 100): vem de um contador persistente (tabela `counters`), nunca reutiliza números de clientes excluídos, é gerado no servidor e não pode ser escolhido pelo cliente da API. Clientes antigos são numerados na ordem de cadastro ao iniciar.
+- **Migration** `20261031_0008` (aditiva: `customers.public_seq`, `service_orders.equipment_type`, tabela `counters`). Verificada em SQLite temporário; não foi aplicada no Supabase/PostgreSQL.

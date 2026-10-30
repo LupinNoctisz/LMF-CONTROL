@@ -5,7 +5,7 @@ Regras (a pedido do usuário):
     Aceita também 10 dígitos (DDD + 8, telefone fixo). Letras são recusadas.
     Formato gravado: "(92) 9 9815-8767" (celular) ou "(92) 3234-5678" (fixo).
   * CPF: exatamente 11 dígitos, gravado como "999.888.777-54". Letras são recusadas.
-    Os dígitos verificadores NÃO são conferidos: só o formato é imposto.
+    Os dígitos verificadores são conferidos (CPFs com todos os dígitos iguais são recusados).
 
 Os validadores devem ser usados apenas em esquemas de ENTRADA. Em esquemas de resposta eles
 quebrariam a listagem inteira se um registro antigo tiver valor fora do padrão.
@@ -58,4 +58,27 @@ def normalize_cpf(value: str | None) -> str | None:
     digits = _digits(text)
     if len(digits) != 11:
         raise ValueError(f"CPF inválido: {len(digits)} dígitos informados. {CPF_HELP}")
+    if not _cpf_check_digits_ok(digits):
+        raise ValueError("CPF inválido: os dígitos verificadores não conferem.")
     return f"{digits[:3]}.{digits[3:6]}.{digits[6:9]}-{digits[9:]}"
+
+
+def _cpf_check_digits_ok(digits: str) -> bool:
+    if len(set(digits)) == 1:
+        return False
+    for size in (9, 10):
+        total = sum(int(digits[i]) * (size + 1 - i) for i in range(size))
+        if (total * 10 % 11) % 10 != int(digits[size]):
+            return False
+    return True
+
+
+SERIAL_MESSAGE = "Número de série incorreto. O número de série deve conter exatamente 15 dígitos."
+
+
+def normalize_serial(value: str | None) -> str:
+    """Número de série: exatamente 15 dígitos, guardado como TEXTO (zeros à esquerda preservados)."""
+    text = "" if value is None else str(value).strip()
+    if not text.isascii() or not text.isdigit() or len(text) != 15:
+        raise ValueError(SERIAL_MESSAGE)
+    return text

@@ -42,6 +42,7 @@ class Customer(Timestamped):
     whatsapp: Mapped[str | None] = mapped_column(String(40))
     email: Mapped[str | None] = mapped_column(String(200))
     document: Mapped[str | None] = mapped_column(String(30), index=True)
+    public_seq: Mapped[int | None] = mapped_column(Integer, unique=True, index=True)  # nº público sequencial (01, 02...)
     address: Mapped[str | None] = mapped_column(Text)
     notes: Mapped[str | None] = mapped_column(Text)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -93,7 +94,8 @@ class ServiceOrder(Timestamped):
     number: Mapped[str] = mapped_column(String(30), unique=True, index=True)
     customer_id: Mapped[int] = mapped_column(ForeignKey('customers.id'))
     equipment: Mapped[str] = mapped_column(String(200))
-    serial: Mapped[str | None] = mapped_column(String(100))
+    serial: Mapped[str | None] = mapped_column(String(100))  # texto: preserva zeros à esquerda
+    equipment_type: Mapped[str | None] = mapped_column(String(20), index=True)
     accessories: Mapped[str | None] = mapped_column(Text)
     physical_condition: Mapped[str | None] = mapped_column(Text)
     reported_fault: Mapped[str] = mapped_column(Text)
@@ -166,6 +168,12 @@ class GuaranteeOccurrence(Timestamped):
     resolution: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(30), default='aberta')
     closed_on: Mapped[date | None] = mapped_column(Date)
+
+class Counter(Timestamped):
+    """Contadores persistentes (nunca reutilizam números já emitidos)."""
+    __tablename__ = 'counters'
+    name: Mapped[str] = mapped_column(String(60), unique=True)
+    value: Mapped[int] = mapped_column(Integer, default=0)
 
 class ServiceOrderPhoto(Timestamped):
     """Foto anexada a uma ordem de serviço. O arquivo fica em DATA_DIR/documentos (incluído nos backups)."""

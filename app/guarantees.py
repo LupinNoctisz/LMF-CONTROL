@@ -30,7 +30,7 @@ def warranty_end(starts_on: date) -> date:
     return starts_on + timedelta(days=GUARANTEE_DAYS)
 
 
-def prepare_guarantee(values: dict, current: Guarantee | None) -> None:
+def prepare_guarantee(values: dict, current: Guarantee | None, db=None) -> None:
     """Define vencimento e duração a partir da data de início (chamado em criar/atualizar)."""
     starts_on = values["starts_on"]
     if current is not None and current.starts_on == starts_on and current.ends_on and current.duration_days:
