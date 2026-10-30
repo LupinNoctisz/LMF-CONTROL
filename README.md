@@ -72,6 +72,14 @@ python scripts/migrate_json_to_postgres.py --json CAMINHO\lmf_control.json --dat
 
 A URL também pode vir da variável `LMF_DATABASE_URL`. Código de saída: 0 = sucesso, 1 = erro (nada gravado), 2 = gravou, mas a validação encontrou diferenças. Valores monetários continuam como `Float` (precisão dupla), exatamente como no JSON; mudar para `NUMERIC` é uma decisão separada. Os testes (`tests/test_migration.py`) rodam em SQLite e, com `LMF_TEST_DATABASE_URL` apontando para um PostgreSQL **descartável**, também em PostgreSQL (o schema `public` desse banco é apagado a cada teste).
 
+## Validação de telefone/CPF e fotos das ordens de serviço
+
+- **Telefone e WhatsApp** (clientes e fornecedores): DDD + número, no máximo 11 dígitos (DDD + 9 dígitos). Letras são bloqueadas na digitação e recusadas pelo servidor. Também é aceito DDD + 8 dígitos (telefone fixo). Formato gravado: `(92) 9 9815-8767`.
+- **CPF** (cadastro de clientes): exatamente 11 números, gravado como `999.888.777-54`. Só o formato é conferido; os dígitos verificadores não são calculados. CNPJ (14 dígitos) deixa de ser aceito nesse campo.
+- Registros antigos fora do padrão continuam aparecendo nas listas; para editá-los é preciso corrigir o valor (o formulário avisa e não corta o dado em silêncio).
+- **Fotos da OS**: até 6 por ordem de serviço, JPEG, PNG ou WebP, até 8 MB cada. O tipo é conferido pelo conteúdo do arquivo. Ficam em `data/documentos/ordens-servico/<id da OS>/`, pasta já incluída nos backups e devolvida na restauração. Excluir a OS exclui as fotos. A tabela `service_order_photos` (migração `20261029_0006`) guarda só os metadados; o script de migração para PostgreSQL copia essas linhas, **mas não os arquivos de imagem**.
+- Avisos de erro ao salvar agora aparecem por cima do formulário aberto. Antes ficavam escondidos atrás dele, e a tela parecia travada.
+
 ## Testes
 
 Após instalar os requisitos: `python -m pytest`. Para iniciar manualmente: `python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`.

@@ -3,7 +3,7 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal
 import shutil, zipfile, io, json, threading, ipaddress, time as time_module, hmac, os
-import unicodedata, re
+import unicodedata, re, uuid
 if os.name=='nt': import msvcrt as _file_lock
 else: import fcntl as _file_lock
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query, Header, Request, Response
@@ -16,9 +16,10 @@ from sqlalchemy import or_, func, inspect
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from openpyxl import load_workbook, Workbook
 from .database import Base, engine, get_db, DATA_DIR, BACKUP_DIR, IMPORT_BACKUP_DIR, DB_PATH, JSON_DB_PATH, SessionLocal, DATA_LOCK, _backup_path_notice, initialize_json_database, acquire_data_lock, release_data_lock, DatabaseBusyError, SLOW_LOCK_SECONDS
-from .models import Product, Movement, Customer, Supplier, BankAccount, AccountBalanceAdjustment, AppUser, BankTransaction, ServiceOrder, Order, OrderItem, PurchaseReceipt, Guarantee, GuaranteeOccurrence, FinancialEntry, ImportLog, Sale, SaleItem, ServicePart, ServiceOrderEvent
+from .models import Product, Movement, Customer, Supplier, BankAccount, AccountBalanceAdjustment, AppUser, BankTransaction, ServiceOrder, Order, OrderItem, PurchaseReceipt, ServiceOrderPhoto, Guarantee, GuaranteeOccurrence, FinancialEntry, ImportLog, Sale, SaleItem, ServicePart, ServiceOrderEvent
 from .services import backup_service
 from . import security
+from .validation import normalize_phone, normalize_cpf
 
 _instance_lock_handle=None
 
@@ -252,6 +253,24 @@ class SupplierIn(BaseModel):
     model_config=ConfigDict(from_attributes=True)
     id:int|None=None
     name:str=Field(min_length=1); contact:str|None=None; phone:str|None=None; whatsapp:str|None=None; email:str|None=None; website:str|None=None; categories:str|None=None; lead_time_days:int|None=None; active:bool=True; notes:str|None=None
+class CustomerInput(CustomerIn):
+    """Somente entrada: valida telefone/WhatsApp (DDD + até 9 dígitos) e CPF (11 dígitos)."""
+    @field_validator('phone')
+    @classmethod
+    def _check_phone(cls,v): return normalize_phone(v,'Telefone')
+    @field_validator('whatsapp')
+    @classmethod
+    def _check_whatsapp(cls,v): return normalize_phone(v,'WhatsApp')
+    @field_validator('document')
+    @classmethod
+    def _check_document(cls,v): return normalize_cpf(v)
+class SupplierInput(SupplierIn):
+    @field_validator('phone')
+    @classmethod
+    def _check_phone(cls,v): return normalize_phone(v,'Telefone')
+    @field_validator('whatsapp')
+    @classmethod
+    def _check_whatsapp(cls,v): return normalize_phone(v,'WhatsApp')
 class ServiceIn(BaseModel):
     model_config=ConfigDict(from_attributes=True)
     id:int|None=None; number:str|None=None
@@ -292,14 +311,15 @@ class SaleEditIn(BaseModel):
 class PurchaseReceiptIn(BaseModel):
     product_id:int; quantity:int=Field(gt=0); unit_cost:float=Field(default=0,ge=0)
 
-def crud_routes(path, model, schema, searchable=()):
+def crud_routes(path, model, schema, searchable=(), input_schema=None):
+    in_schema=input_schema or schema  # entrada pode ser mais rígida que a resposta
     def listing(q:str|None=None, db:Session=Depends(get_db)):
         query=db.query(model)
         if q and searchable: query=query.filter(or_(*[getattr(model,c).ilike(f'%{q}%') for c in searchable]))
         return query.order_by(model.id.desc()).limit(500).all()
     listing.__name__=f'list_{path.replace("-","_")}'
     app.get(f'/api/{path}',response_model=list[schema])(listing)
-    def create(payload:schema,db:Session=Depends(get_db)):
+    def create(payload:in_schema,db:Session=Depends(get_db)):
         values=payload.model_dump(exclude={'id','number'})
         if model is Order:
             year=date.today().year; prefix=f'LMF-PED-{year}-'
@@ -312,7 +332,7 @@ def crud_routes(path, model, schema, searchable=()):
         return obj
     create.__name__=f'create_{path.replace("-","_")}'
     app.post(f'/api/{path}',response_model=schema)(create)
-    def update(item_id:int,payload:schema,db:Session=Depends(get_db)):
+    def update(item_id:int,payload:in_schema,db:Session=Depends(get_db)):
         obj=db.get(model,item_id)
         if not obj: raise HTTPException(404,'Registro não encontrado')
         for k,v in payload.model_dump(exclude={'id','number'}).items(): setattr(obj,k,v)
@@ -333,8 +353,8 @@ def crud_routes(path, model, schema, searchable=()):
     app.delete(f'/api/{path}/{{item_id}}')(delete)
 
 crud_routes('products',Product,ProductIn,('sku','internal_code','name','category','supplier','brand','model','notes'))
-crud_routes('customers',Customer,CustomerIn,('name','phone','document','email'))
-crud_routes('suppliers',Supplier,SupplierIn,('name','categories','contact','phone','whatsapp','email','website','notes'))
+crud_routes('customers',Customer,CustomerIn,('name','phone','document','email'),input_schema=CustomerInput)
+crud_routes('suppliers',Supplier,SupplierIn,('name','categories','contact','phone','whatsapp','email','website','notes'),input_schema=SupplierInput)
 crud_routes('orders',Order,OrderIn,('number','description','status'))
 crud_routes('guarantees',Guarantee,GuaranteeIn,('item','conditions'))
 crud_routes('finance',FinancialEntry,FinanceIn,('description','category','kind','status','reference','payment_method','external_id'))
@@ -624,7 +644,101 @@ def delete_service(item_id:int,confirm:bool=Query(False),db:Session=Depends(get_
     if db.query(ServicePart).filter_by(service_order_id=item_id).count() or db.query(FinancialEntry).filter_by(service_order_id=item_id).count() or db.query(Guarantee).filter_by(service_order_id=item_id).count():
         raise HTTPException(409,'Esta OS tem peças, lançamentos financeiros ou garantias vinculados. Edite os vínculos ou mantenha a OS para preservar o histórico.')
     db.query(ServiceOrderEvent).filter_by(service_order_id=item_id).delete(synchronize_session=False)
-    db.delete(obj); db.commit(); return {'deleted':True,'id':item_id}
+    photo_files=[_photo_dir(item_id)/row.stored_name for row in db.query(ServiceOrderPhoto).filter_by(service_order_id=item_id).all()]
+    db.query(ServiceOrderPhoto).filter_by(service_order_id=item_id).delete(synchronize_session=False)
+    db.delete(obj); db.commit()
+    _remove_photo_files(item_id,photo_files)  # só depois do commit: se falhar, os arquivos continuam
+    return {'deleted':True,'id':item_id}
+
+# --- Fotos das ordens de serviço (máx. 6 por OS) -------------------------------------------
+MAX_PHOTOS_PER_ORDER=6
+MAX_PHOTO_BYTES=8*1024*1024
+PHOTO_EXTENSIONS={'image/jpeg':'.jpg','image/png':'.png','image/webp':'.webp'}
+_STORED_NAME=re.compile(r'^[0-9a-f]{32}\.(jpg|png|webp)$')
+
+def _photo_dir(order_id:int)->Path:
+    return DATA_DIR/'documentos'/'ordens-servico'/str(int(order_id))
+
+def _remove_photo_files(order_id:int,files)->None:
+    for path in files:
+        try: path.unlink(missing_ok=True)
+        except OSError: _lmf_logger.warning('Não foi possível remover a foto %s',path)
+    try: _photo_dir(order_id).rmdir()  # só remove se estiver vazia
+    except OSError: pass
+
+def _sniff_image(head:bytes)->str|None:
+    """Tipo real pelo conteúdo (não confia na extensão nem no Content-Type enviados)."""
+    if head.startswith(b'\xff\xd8\xff'): return 'image/jpeg'
+    if head.startswith(b'\x89PNG\r\n\x1a\n'): return 'image/png'
+    if head[:4]==b'RIFF' and head[8:12]==b'WEBP': return 'image/webp'
+    return None
+
+def _clean_filename(name:str|None)->str:
+    base=Path((name or 'foto').replace('\\','/')).name
+    base=''.join(ch for ch in base if ch.isprintable()).strip()
+    return (base or 'foto')[:255]
+
+def _photo_out(order_id:int,row:ServiceOrderPhoto)->dict:
+    return {'id':row.id,'original_name':row.original_name,'content_type':row.content_type,'size':row.size,'url':f'/api/service-orders/{order_id}/photos/{row.id}/file'}
+
+def _require_order(db:Session,order_id:int)->ServiceOrder:
+    order=db.get(ServiceOrder,order_id)
+    if not order: raise HTTPException(404,'Ordem de serviço não encontrada')
+    return order
+
+@app.get('/api/service-orders/{order_id}/photos')
+def list_order_photos(order_id:int,db:Session=Depends(get_db)):
+    _require_order(db,order_id)
+    rows=db.query(ServiceOrderPhoto).filter_by(service_order_id=order_id).order_by(ServiceOrderPhoto.id).all()
+    return {'max':MAX_PHOTOS_PER_ORDER,'items':[_photo_out(order_id,row) for row in rows]}
+
+@app.post('/api/service-orders/{order_id}/photos')
+def upload_order_photos(order_id:int,files:list[UploadFile]=File(...),db:Session=Depends(get_db)):
+    _require_order(db,order_id)
+    if not files: raise HTTPException(400,'Nenhuma foto enviada.')
+    existing=db.query(func.count(ServiceOrderPhoto.id)).filter(ServiceOrderPhoto.service_order_id==order_id).scalar() or 0
+    if existing+len(files)>MAX_PHOTOS_PER_ORDER:
+        raise HTTPException(400,f'Limite de {MAX_PHOTOS_PER_ORDER} fotos por ordem de serviço: já existem {existing} e você enviou {len(files)}. Nenhuma foto foi anexada.')
+    prepared=[]
+    for upload in files:  # valida TUDO antes de gravar qualquer coisa
+        name=_clean_filename(upload.filename)
+        data=upload.file.read(MAX_PHOTO_BYTES+1)
+        if not data: raise HTTPException(400,f'A foto "{name}" está vazia. Nenhuma foto foi anexada.')
+        if len(data)>MAX_PHOTO_BYTES: raise HTTPException(400,f'A foto "{name}" passa de {MAX_PHOTO_BYTES//1024//1024} MB. Nenhuma foto foi anexada.')
+        kind=_sniff_image(data[:16])
+        if not kind: raise HTTPException(400,f'"{name}" não é uma imagem JPEG, PNG ou WebP válida. Nenhuma foto foi anexada.')
+        prepared.append((name,kind,data))
+    folder=_photo_dir(order_id); written=[]; rows=[]
+    try:
+        folder.mkdir(parents=True,exist_ok=True)
+        for name,kind,data in prepared:
+            stored=f'{uuid.uuid4().hex}{PHOTO_EXTENSIONS[kind]}'
+            (folder/stored).write_bytes(data); written.append(folder/stored)
+            row=ServiceOrderPhoto(service_order_id=order_id,original_name=name,stored_name=stored,content_type=kind,size=len(data)); db.add(row); rows.append(row)
+        db.commit()
+    except Exception:
+        db.rollback(); _remove_photo_files(order_id,written)
+        api_logger.exception('Falha ao gravar fotos da OS %s',order_id)
+        raise HTTPException(500,'Não foi possível salvar as fotos. Nenhuma foto foi anexada.')
+    return {'max':MAX_PHOTOS_PER_ORDER,'items':[_photo_out(order_id,row) for row in rows]}
+
+@app.get('/api/service-orders/{order_id}/photos/{photo_id}/file')
+def get_order_photo(order_id:int,photo_id:int,db:Session=Depends(get_db)):
+    row=db.get(ServiceOrderPhoto,photo_id)
+    if not row or row.service_order_id!=order_id: raise HTTPException(404,'Foto não encontrada')
+    if not _STORED_NAME.match(row.stored_name or ''): raise HTTPException(404,'Foto não encontrada')
+    path=_photo_dir(order_id)/row.stored_name
+    if not path.is_file(): raise HTTPException(404,'O arquivo desta foto não está na pasta de documentos (pode ter sido removido ou não veio no backup).')
+    return FileResponse(path,media_type=row.content_type,headers={'X-Content-Type-Options':'nosniff','Cache-Control':'private, max-age=3600','Content-Disposition':'inline'})
+
+@app.delete('/api/service-orders/{order_id}/photos/{photo_id}')
+def delete_order_photo(order_id:int,photo_id:int,db:Session=Depends(get_db)):
+    row=db.get(ServiceOrderPhoto,photo_id)
+    if not row or row.service_order_id!=order_id: raise HTTPException(404,'Foto não encontrada')
+    stored=row.stored_name
+    db.delete(row); db.commit()
+    if _STORED_NAME.match(stored or ''): _remove_photo_files(order_id,[_photo_dir(order_id)/stored])
+    return {'deleted':True,'id':photo_id}
 
 @app.post('/api/products/{product_id}/movement')
 def movement(product_id:int,kind:str=Query(pattern='^(entrada|saida)$'),quantity:int=Query(gt=0),reason:str=Query(min_length=2),reference:str|None=None,idempotency_key:str|None=Header(default=None,alias='Idempotency-Key'),db:Session=Depends(get_db)):

@@ -167,6 +167,15 @@ class GuaranteeOccurrence(Timestamped):
     status: Mapped[str] = mapped_column(String(30), default='aberta')
     closed_on: Mapped[date | None] = mapped_column(Date)
 
+class ServiceOrderPhoto(Timestamped):
+    """Foto anexada a uma ordem de serviço. O arquivo fica em DATA_DIR/documentos (incluído nos backups)."""
+    __tablename__ = 'service_order_photos'
+    service_order_id: Mapped[int] = mapped_column(ForeignKey('service_orders.id'), index=True)
+    original_name: Mapped[str] = mapped_column(String(255))
+    stored_name: Mapped[str] = mapped_column(String(80), unique=True)
+    content_type: Mapped[str] = mapped_column(String(40))
+    size: Mapped[int] = mapped_column(Integer, default=0)
+
 class ServiceOrderEvent(Timestamped):
     __tablename__ = 'service_order_events'
     service_order_id: Mapped[int] = mapped_column(ForeignKey('service_orders.id', ondelete='CASCADE'), index=True)
