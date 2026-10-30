@@ -123,3 +123,8 @@ textarea { width: 100%; min-height: 5rem; font: inherit; color: inherit; backgro
 .photo-grid .photo-remove { position: absolute; top: 4px; right: 4px; width: 26px; height: 26px; padding: 0; border-radius: 50%; border: 0; background: #000b; color: #fff; font-size: 1rem; line-height: 1; cursor: pointer; }
 .photo-grid figcaption { position: absolute; left: 4px; bottom: 4px; font-size: .68rem; background: #000b; color: #fff; padding: 1px 6px; border-radius: 4px; }
 #toast { max-width: min(520px, 90vw); }
+#op-dialog { width: min(420px, 94vw); }
+#op-dialog label { display: block; margin: 10px 0 4px; }
+#op-dialog input { width: 100%; }
+#op-error { color: #c0392b; min-height: 1.3em; font-size: .85rem; margin: 6px 0; }
+.op-actions { display: flex; gap: 8px; justify-content: flex-end; }

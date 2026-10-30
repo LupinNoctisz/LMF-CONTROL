@@ -252,3 +252,29 @@ class ImportLog(Timestamped):
     __tablename__ = 'import_logs'
     filename: Mapped[str] = mapped_column(String(250))
     result: Mapped[str] = mapped_column(Text)
+
+
+class AuditLog(Timestamped):
+    """Histórico de auditoria somente de acréscimo: nenhuma rota altera ou apaga estas linhas.
+    Nunca guarda senhas, tokens nem hashes (apenas quem, o quê, quando, de onde e o resultado)."""
+    __tablename__ = 'audit_log'
+    user_id: Mapped[int | None] = mapped_column(ForeignKey('app_users.id'), index=True)
+    username: Mapped[str] = mapped_column(String(60), default='sistema')
+    action: Mapped[str] = mapped_column(String(80), index=True)
+    target: Mapped[str | None] = mapped_column(String(120))
+    outcome: Mapped[str] = mapped_column(String(20), index=True)
+    ip: Mapped[str | None] = mapped_column(String(64))
+    details: Mapped[str | None] = mapped_column(String(500))
+
+
+class OperationAuthorization(Timestamped):
+    """Autorização administrativa de USO ÚNICO para uma operação destrutiva sobre um alvo específico.
+    Só o hash SHA-256 do token é guardado; o token em si existe apenas na resposta à emissão."""
+    __tablename__ = 'operation_authorizations'
+    user_id: Mapped[int] = mapped_column(ForeignKey('app_users.id'), index=True)
+    operation: Mapped[str] = mapped_column(String(80))
+    target: Mapped[str] = mapped_column(String(120))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime)
+    ip: Mapped[str | None] = mapped_column(String(64))
