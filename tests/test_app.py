@@ -133,7 +133,7 @@ def test_customer_service_and_backup():
         authenticate(c)
         assert BACKUP_DIR.is_dir()
         customer=c.post('/api/customers',json={'name':'Cliente teste'}).json()
-        so=c.post('/api/service-orders',json={'customer_id':customer['id'],'equipment':'Notebook','reported_fault':'Não liga'})
+        so=c.post('/api/service-orders',json={'customer_id':customer['id'],'equipment':'Notebook','equipment_type':'Notebook','serial':'012345678901234','reported_fault':'Não liga'})
         assert so.status_code==200
         manual=c.post('/api/backups')
         assert manual.status_code==200
@@ -157,7 +157,7 @@ def test_supplier_and_service_order_search_cover_operational_fields():
         assert any(row['id']==supplier['id'] for row in c.get(f'/api/suppliers?q=contato-{marker}').json())
 
         customer=c.post('/api/customers',json={'name':f'Cliente {marker}'}).json()
-        service=c.post('/api/service-orders',json={'customer_id':customer['id'],'equipment':'Notebook','reported_fault':f'Falha placa {marker}'}).json()
+        service=c.post('/api/service-orders',json={'customer_id':customer['id'],'equipment':'Notebook','equipment_type':'Notebook','serial':'012345678901234','reported_fault':f'Falha placa {marker}'}).json()
         assert service.get('id')
         assert any(row['id']==service['id'] for row in c.get(f'/api/service-orders?q=Falha%20placa%20{marker}').json())
         assert any(row['id']==service['id'] for row in c.get(f'/api/service-orders?q=Cliente%20{marker}').json())

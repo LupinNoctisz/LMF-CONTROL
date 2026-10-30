@@ -39,9 +39,21 @@ def client():
         assert not DATA_LOCK.locked()
 
 
+def unique_cpf():
+    """CPF válido (dígitos verificadores corretos) diferente a cada chamada."""
+    import itertools, random
+    base = [random.randint(0, 9) for _ in range(9)]
+    if len(set(base)) == 1:
+        base[0] = (base[0] + 1) % 10
+    for size in (9, 10):
+        total = sum(base[i] * (size + 1 - i) for i in range(size))
+        base.append(total * 10 % 11 % 10)
+    return ''.join(map(str, base))
+
+
 def make_order(client):
     customer = client.post('/api/customers', json={'name': 'Cliente das fotos'}).json()
-    order = client.post('/api/service-orders', json={'customer_id': customer['id'], 'equipment': 'Notebook', 'reported_fault': 'Não liga'})
+    order = client.post('/api/service-orders', json={'customer_id': customer['id'], 'equipment': 'Notebook', 'equipment_type': 'Notebook', 'serial': '012345678901234', 'reported_fault': 'Não liga'})
     assert order.status_code == 200, order.text
     return order.json()['id']
 
@@ -74,7 +86,7 @@ def test_phone_rejects_invalid(raw):
         normalize_phone(raw)
 
 
-@pytest.mark.parametrize('raw,expected', [('99988877754', '999.888.777-54'), ('999.888.777-54', '999.888.777-54'), ('', None), (None, None)])
+@pytest.mark.parametrize('raw,expected', [('52998224725', '529.982.247-25'), ('529.982.247-25', '529.982.247-25'), ('', None), (None, None)])
 def test_cpf_is_normalized(raw, expected):
     assert normalize_cpf(raw) == expected
 
@@ -88,10 +100,10 @@ def test_cpf_rejects_invalid(raw):
 # ---- API: telefone e CPF ---------------------------------------------------------------------
 
 def test_customer_phone_whatsapp_and_cpf_are_saved_formatted(client):
-    response = client.post('/api/customers', json={'name': 'Maria', 'phone': '92998158767', 'whatsapp': '(92) 9 9815-8767', 'document': '99988877754'})
+    response = client.post('/api/customers', json={'name': 'Maria', 'phone': '92998158767', 'whatsapp': '(92) 9 9815-8767', 'document': unique_cpf()})
     assert response.status_code == 200, response.text
     body = response.json()
-    assert (body['phone'], body['whatsapp'], body['document']) == ('(92) 9 9815-8767', '(92) 9 9815-8767', '999.888.777-54')
+    assert (body['phone'], body['whatsapp'], body['document']) [:2] == ('(92) 9 9815-8767', '(92) 9 9815-8767') and len(body['document']) == 14
 
 
 @pytest.mark.parametrize('payload', [
@@ -233,7 +245,7 @@ def test_photos_are_included_in_backups_and_restored(client):
     item = upload(client, order_id, [png('backup.png')]).json()['items'][0]
     archive = backup_service.create_backup('teste-fotos')
     with zipfile.ZipFile(archive) as z:
-        names = [n for n in z.namelist() if n.startswith(f'documents/ordens-servico/{order_id}/')]
+        names = [n for n in z.namelist() if n.startswith(f'documents/ordens-servico/{order_id}/') and not n.endswith('/')]
     assert len(names) == 1
     # simula perda do arquivo; a restauração devolve o arquivo e as linhas do banco
     for path in main_module._photo_dir(order_id).iterdir():

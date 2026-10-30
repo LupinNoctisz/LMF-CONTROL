@@ -19,7 +19,8 @@ from .database import Base, engine, get_db, DATA_DIR, BACKUP_DIR, IMPORT_BACKUP_
 from .models import Product, Movement, Customer, Supplier, BankAccount, AccountBalanceAdjustment, AppUser, BankTransaction, ServiceOrder, Order, OrderItem, PurchaseReceipt, ServiceOrderPhoto, Guarantee, GuaranteeOccurrence, FinancialEntry, ImportLog, Sale, SaleItem, ServicePart, ServiceOrderEvent
 from .services import backup_service
 from . import security, authorization, guarantees as guarantee_rules
-from .validation import normalize_phone, normalize_cpf
+from .validation import normalize_phone, normalize_cpf, normalize_serial
+from . import customers as customer_rules
 
 _instance_lock_handle=None
 
@@ -88,6 +89,7 @@ async def lifespan(app):
         if not db.query(BankAccount).filter(BankAccount.business_unit=='Assistência',BankAccount.provider=='InfinitePay').first():
             db.add(BankAccount(name='Conta da Assistência',business_unit='Assistência',provider='InfinitePay',opening_balance=0,notes='Conta de controle local. Preencha o saldo inicial real antes de usar o saldo calculado.'))
             db.commit()
+        customer_rules.assign_missing_public_seq(db)
         admin=db.query(AppUser).filter(AppUser.is_admin==True,AppUser.active==True).order_by(AppUser.id).first()
         if admin:
             try: recovery_code=security.RECOVERY_CODE_PATH.read_text(encoding='utf-8').strip()
@@ -290,7 +292,7 @@ class ProductIn(BaseModel):
 class CustomerIn(BaseModel):
     model_config=ConfigDict(from_attributes=True)
     id:int|None=None
-    name:str=Field(min_length=1); phone:str|None=None; whatsapp:str|None=None; email:str|None=None; document:str|None=None; address:str|None=None; notes:str|None=None; active:bool=True
+    name:str=Field(min_length=1); phone:str|None=None; whatsapp:str|None=None; email:str|None=None; document:str|None=None; address:str|None=None; notes:str|None=None; active:bool=True; public_seq:int|None=None
 class SupplierIn(BaseModel):
     model_config=ConfigDict(from_attributes=True)
     id:int|None=None
@@ -316,8 +318,28 @@ class SupplierInput(SupplierIn):
 class ServiceIn(BaseModel):
     model_config=ConfigDict(from_attributes=True)
     id:int|None=None; number:str|None=None
-    customer_id:int; equipment:str=Field(min_length=1); serial:str|None=None; reported_fault:str=Field(min_length=1); diagnosis:str|None=None
+    customer_id:int; equipment:str=Field(min_length=1); serial:str|None=None; equipment_type:str|None=None; reported_fault:str=Field(min_length=1); diagnosis:str|None=None
     status:str='Recebido'; estimate:float=Field(default=0,ge=0); cost:float=Field(default=0,ge=0); charged:float=Field(default=0,ge=0); approval:str='Pendente'; entered_on:date=Field(default_factory=date.today); due_on:date|None=None; delivered_on:date|None=None; completed_on:date|None=None; accessories:str|None=None; physical_condition:str|None=None; service_executed:str|None=None; notes:str|None=None
+class NewCustomerData(BaseModel):
+    name:str|None=None; document:str|None=None; phone:str|None=None; whatsapp:str|None=None; email:str|None=None
+    @field_validator('phone')
+    @classmethod
+    def _p(cls,v): return normalize_phone(v,'Telefone')
+    @field_validator('whatsapp')
+    @classmethod
+    def _w(cls,v): return normalize_phone(v,'WhatsApp')
+    @field_validator('document')
+    @classmethod
+    def _d(cls,v): return normalize_cpf(v)
+class ServiceInput(ServiceIn):
+    """Entrada da OS: cliente existente (customer_id) OU dados do cliente (CPF) para localizar/cadastrar."""
+    customer_id:int|None=None
+    customer:NewCustomerData|None=None
+    equipment_type:Literal['Celular','Computador','Notebook','Videogame']
+    serial:str
+    @field_validator('serial',mode='before')
+    @classmethod
+    def _serial(cls,v): return normalize_serial(v)
 class OrderIn(BaseModel):
     model_config=ConfigDict(from_attributes=True)
     id:int|None=None; number:str|None=None
@@ -365,8 +387,8 @@ def crud_routes(path, model, schema, searchable=(), input_schema=None, delete_gu
     listing.__name__=f'list_{path.replace("-","_")}'
     app.get(f'/api/{path}',response_model=list[schema])(listing)
     def create(payload:in_schema,db:Session=Depends(get_db)):
-        values=payload.model_dump(exclude={'id','number'})
-        if prepare: prepare(values,None)
+        values=payload.model_dump(exclude={'id','number','public_seq'})
+        if prepare: prepare(values,None,db)
         if model is Order:
             year=date.today().year; prefix=f'LMF-PED-{year}-'
             last=db.query(Order).filter(Order.number.like(prefix+'%')).order_by(Order.id.desc()).first()
@@ -381,8 +403,8 @@ def crud_routes(path, model, schema, searchable=(), input_schema=None, delete_gu
     def update(item_id:int,payload:in_schema,db:Session=Depends(get_db)):
         obj=db.get(model,item_id)
         if not obj: raise HTTPException(404,'Registro não encontrado')
-        values=payload.model_dump(exclude={'id','number'})
-        if prepare: prepare(values,obj)
+        values=payload.model_dump(exclude={'id','number','public_seq'})
+        if prepare: prepare(values,obj,db)
         for k,v in values.items(): setattr(obj,k,v)
         db.commit(); db.refresh(obj); return obj
     update.__name__=f'update_{path.replace("-","_")}'
@@ -402,7 +424,14 @@ def crud_routes(path, model, schema, searchable=(), input_schema=None, delete_gu
     app.delete(f'/api/{path}/{{item_id}}')(delete)
 
 crud_routes('products',Product,ProductIn,('sku','internal_code','name','category','supplier','brand','model','notes'))
-crud_routes('customers',Customer,CustomerIn,('name','phone','document','email'),input_schema=CustomerInput)
+@app.get('/api/customers/lookup')
+def lookup_customer(document:str,db:Session=Depends(get_db)):
+    try: cpf=normalize_cpf(document)
+    except ValueError as e: raise HTTPException(400,str(e))
+    found=customer_rules.find_by_document(db,cpf)
+    if not found: raise HTTPException(404,'Cliente não encontrado')
+    return {'id':found.id,'public_seq':found.public_seq,'public_code':customer_rules.public_code(found.public_seq),'name':found.name,'document':found.document,'phone':found.phone,'whatsapp':found.whatsapp,'email':found.email}
+crud_routes('customers',Customer,CustomerIn,('name','phone','document','email'),input_schema=CustomerInput,prepare=customer_rules.prepare_customer)
 crud_routes('suppliers',Supplier,SupplierIn,('name','categories','contact','phone','whatsapp','email','website','notes'),input_schema=SupplierInput)
 crud_routes('orders',Order,OrderIn,('number','description','status'))
 crud_routes('guarantees',Guarantee,GuaranteeIn,('item','conditions'),input_schema=GuaranteeInput,prepare=guarantee_rules.prepare_guarantee,before_list=guarantee_rules.expire_due_guarantees)
@@ -663,29 +692,40 @@ def create_guarantee_occurrence(guarantee_id:int,payload:GuaranteeOccurrenceIn,d
     if item.status=='resolvida': item.closed_on=date.today()
     db.add(item); db.commit(); db.refresh(item); return item
 
+def _resolve_service_customer(db,payload):
+    if payload.customer_id is not None:
+        found=db.get(Customer,payload.customer_id)
+        if not found: raise HTTPException(400,'Cliente não encontrado')
+        return found
+    if payload.customer is None: raise HTTPException(400,'Informe o cliente (CPF) da ordem de serviço.')
+    return customer_rules.get_or_create_for_order(db,payload.customer.model_dump())
+
 @app.post('/api/service-orders',response_model=ServiceIn)
-def create_service(payload:ServiceIn,db:Session=Depends(get_db)):
-    if not db.get(Customer,payload.customer_id): raise HTTPException(400,'Cliente não encontrado')
+def create_service(payload:ServiceInput,db:Session=Depends(get_db)):
+    customer=_resolve_service_customer(db,payload)
     year=date.today().year
     last=db.query(ServiceOrder).filter(ServiceOrder.number.like(f'LMF-OS-{year}-%')).order_by(ServiceOrder.id.desc()).first()
     seq=int(last.number[-4:])+1 if last else 1
-    obj=ServiceOrder(**payload.model_dump(exclude={'id','number'}),number=f'LMF-OS-{year}-{seq:04d}'); db.add(obj); db.commit(); db.refresh(obj); return obj
+    values=payload.model_dump(exclude={'id','number','customer'}); values['customer_id']=customer.id
+    obj=ServiceOrder(**values,number=f'LMF-OS-{year}-{seq:04d}'); db.add(obj); db.commit(); db.refresh(obj); return obj
 
 @app.get('/api/service-orders',response_model=list[ServiceIn])
-def list_services(q:str|None=None,db:Session=Depends(get_db)):
+def list_services(q:str|None=None,equipment_type:str|None=None,db:Session=Depends(get_db)):
     query=db.query(ServiceOrder)
+    if equipment_type: query=query.filter(ServiceOrder.equipment_type==equipment_type)
     if q:
         pattern=f'%{q}%'
-        query=query.outerjoin(Customer,ServiceOrder.customer_id==Customer.id).filter(or_(ServiceOrder.number.ilike(pattern),ServiceOrder.equipment.ilike(pattern),ServiceOrder.serial.ilike(pattern),ServiceOrder.reported_fault.ilike(pattern),ServiceOrder.diagnosis.ilike(pattern),ServiceOrder.service_executed.ilike(pattern),ServiceOrder.status.ilike(pattern),ServiceOrder.approval.ilike(pattern),Customer.name.ilike(pattern)))
+        query=query.outerjoin(Customer,ServiceOrder.customer_id==Customer.id).filter(or_(ServiceOrder.number.ilike(pattern),ServiceOrder.equipment.ilike(pattern),ServiceOrder.serial.ilike(pattern),ServiceOrder.equipment_type.ilike(pattern),ServiceOrder.reported_fault.ilike(pattern),ServiceOrder.diagnosis.ilike(pattern),ServiceOrder.service_executed.ilike(pattern),ServiceOrder.status.ilike(pattern),ServiceOrder.approval.ilike(pattern),Customer.name.ilike(pattern)))
     return query.order_by(ServiceOrder.id.desc()).limit(500).all()
 
 @app.put('/api/service-orders/{item_id}',response_model=ServiceIn)
-def update_service(item_id:int,payload:ServiceIn,db:Session=Depends(get_db)):
+def update_service(item_id:int,payload:ServiceInput,db:Session=Depends(get_db)):
     obj=db.get(ServiceOrder,item_id)
     if not obj: raise HTTPException(404,'Ordem de serviço não encontrada')
     if payload.status=='Entregue' and not payload.diagnosis: raise HTTPException(400,'Informe o diagnóstico antes de concluir a ordem')
     old_status=obj.status
-    for key,value in payload.model_dump(exclude={'id','number'}).items(): setattr(obj,key,value)
+    values=payload.model_dump(exclude={'id','number','customer'}); values['customer_id']=_resolve_service_customer(db,payload).id
+    for key,value in values.items(): setattr(obj,key,value)
     if obj.status=='Entregue' and not obj.delivered_on: obj.delivered_on=date.today()
     if old_status!=obj.status: db.add(ServiceOrderEvent(service_order_id=obj.id,old_status=old_status,new_status=obj.status,details='Atualização operacional'))
     db.commit(); db.refresh(obj); return obj
@@ -948,12 +988,12 @@ def backup():
 @app.get('/api/backups')
 def backups(): return {'items':backup_service.list_backups(),'importable':backup_service.importable_backups(),'paths':{'data':str(DATA_DIR),'database':str(DB_PATH),'backups':str(BACKUP_DIR),'import':str(IMPORT_BACKUP_DIR)},'backup_path_notice':_backup_path_notice,'settings':backup_service.read_settings(),'last_status':backup_service.last_status()}
 @app.post('/api/backups/{filename}/restore')
-def restore(filename:str,request:Request,confirm:bool=Query(False)):
+def restore(filename:str,request:Request,confirm:bool=Query(False),allow_incomplete:bool=Query(False)):
     if not confirm: raise HTTPException(400,'Confirme a restauração com confirm=true')
     if Path(filename).name!=filename: raise HTTPException(404,'Backup não encontrado')
     authorization.require_authorization_standalone(request,'backup.restaurar',filename)
     src=BACKUP_DIR/filename
-    try: return backup_service.restore_backup(src,backup_service.schema_revision())
+    try: return backup_service.restore_backup(src,backup_service.schema_revision(),allow_incomplete)
     except Exception as e: raise HTTPException(400,f'Falha na restauração: {e}')
 
 @app.post('/api/backups/import/{filename}')

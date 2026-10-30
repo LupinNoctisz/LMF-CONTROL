@@ -128,3 +128,5 @@ textarea { width: 100%; min-height: 5rem; font: inherit; color: inherit; backgro
 #op-dialog input { width: 100%; }
 #op-error { color: #c0392b; min-height: 1.3em; font-size: .85rem; margin: 6px 0; }
 .op-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.os-section { border: 1px solid var(--line, #d8dee9); border-radius: 8px; margin: 0 0 12px; padding: 8px 12px 12px; }
+.os-section legend { font-weight: 600; padding: 0 6px; }
