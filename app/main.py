@@ -15,10 +15,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_, func, inspect
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from openpyxl import load_workbook, Workbook
-from .database import Base, engine, get_db, DATA_DIR, BACKUP_DIR, IMPORT_BACKUP_DIR, DB_PATH, JSON_DB_PATH, SessionLocal, DATA_LOCK, _backup_path_notice, initialize_json_database, acquire_data_lock, release_data_lock, DatabaseBusyError, SLOW_LOCK_SECONDS
+from .database import Base, engine, get_db, DATA_DIR, BACKUP_DIR, IMPORT_BACKUP_DIR, DB_PATH, JSON_DB_PATH, SessionLocal, DATA_LOCK, _backup_path_notice, initialize_json_database, acquire_data_lock, release_data_lock, DatabaseBusyError, release_data_lock, DatabaseBusyError, SLOW_LOCK_SECONDS
 from .models import Product, Movement, Customer, Supplier, BankAccount, AccountBalanceAdjustment, AppUser, BankTransaction, ServiceOrder, Order, OrderItem, PurchaseReceipt, ServiceOrderPhoto, Guarantee, GuaranteeOccurrence, FinancialEntry, ImportLog, Sale, SaleItem, ServicePart, ServiceOrderEvent
 from .services import backup_service
-from . import security, authorization
+from . import security, authorization, guarantees as guarantee_rules
 from .validation import normalize_phone, normalize_cpf
 
 _instance_lock_handle=None
@@ -110,8 +110,22 @@ async def lifespan(app):
                 try: backup_service.create_backup('automatico')
                 except Exception as error: backup_service.set_status('falhou',str(error))
     thread=threading.Thread(target=daily_backup,name='lmf-daily-backup',daemon=True); thread.start()
+    def guarantee_expiry():
+        # Expira garantias vencidas sem ninguém abrir a tela: ao iniciar, depois a cada 5 min e logo após a meia-noite.
+        while True:
+            acquired=None
+            try:
+                acquired=acquire_data_lock('expirar-garantias',timeout=10)
+                with SessionLocal() as session: guarantee_rules.expire_due_guarantees(session)
+            except DatabaseBusyError: pass
+            except Exception: logging.getLogger('lmf').exception('Falha ao expirar garantias')
+            finally:
+                if acquired is not None: release_data_lock('expirar-garantias',acquired)
+            now=datetime.now(); midnight=datetime.combine(now.date()+timedelta(days=1),time(0,0,5))
+            if stop.wait(min(300,max(1,(midnight-now).total_seconds()))): break
+    expiry_thread=threading.Thread(target=guarantee_expiry,name='lmf-guarantee-expiry',daemon=True); expiry_thread.start()
     yield
-    stop.set(); thread.join(timeout=2)
+    stop.set(); thread.join(timeout=2); expiry_thread.join(timeout=12)
     authorization.drain_pending(10)  # não perder o registro do resultado de uma operação em andamento
     _release_instance_lock()
 
@@ -313,6 +327,8 @@ class GuaranteeIn(BaseModel):
     model_config=ConfigDict(from_attributes=True)
     id:int|None=None
     customer_id:int; service_order_id:int|None=None; item:str=Field(min_length=1); guarantee_type:str='serviço'; starts_on:date; ends_on:date; duration_days:int|None=None; status:str='ativa'; conditions:str|None=None; notes:str|None=None
+class GuaranteeInput(GuaranteeIn):
+    ends_on:date|None=None  # o vencimento é calculado pelo servidor (início + 90 dias)
 class GuaranteeOccurrenceIn(BaseModel):
     issue:str=Field(min_length=2); resolution:str|None=None; status:Literal['aberta','em análise','resolvida']='aberta'
 class FinanceIn(BaseModel):
@@ -339,9 +355,10 @@ class SaleEditIn(BaseModel):
 class PurchaseReceiptIn(BaseModel):
     product_id:int; quantity:int=Field(gt=0); unit_cost:float=Field(default=0,ge=0)
 
-def crud_routes(path, model, schema, searchable=(), input_schema=None, delete_guard=None, prepare=None):
+def crud_routes(path, model, schema, searchable=(), input_schema=None, delete_guard=None, prepare=None, before_list=None):
     in_schema=input_schema or schema  # entrada pode ser mais rígida que a resposta
     def listing(q:str|None=None, db:Session=Depends(get_db)):
+        if before_list: before_list(db)
         query=db.query(model)
         if q and searchable: query=query.filter(or_(*[getattr(model,c).ilike(f'%{q}%') for c in searchable]))
         return query.order_by(model.id.desc()).limit(500).all()
@@ -388,7 +405,7 @@ crud_routes('products',Product,ProductIn,('sku','internal_code','name','category
 crud_routes('customers',Customer,CustomerIn,('name','phone','document','email'),input_schema=CustomerInput)
 crud_routes('suppliers',Supplier,SupplierIn,('name','categories','contact','phone','whatsapp','email','website','notes'),input_schema=SupplierInput)
 crud_routes('orders',Order,OrderIn,('number','description','status'))
-crud_routes('guarantees',Guarantee,GuaranteeIn,('item','conditions'))
+crud_routes('guarantees',Guarantee,GuaranteeIn,('item','conditions'),input_schema=GuaranteeInput,prepare=guarantee_rules.prepare_guarantee,before_list=guarantee_rules.expire_due_guarantees)
 crud_routes('finance',FinancialEntry,FinanceIn,('description','category','kind','status','reference','payment_method','external_id'),delete_guard=lambda db,request,item_id:authorization.require_authorization(db,request,'financeiro.lancamento.excluir',item_id))
 
 @app.get('/api/accounts')
