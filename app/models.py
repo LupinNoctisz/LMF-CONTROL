@@ -96,6 +96,8 @@ class ServiceOrder(Timestamped):
     equipment: Mapped[str] = mapped_column(String(200))
     serial: Mapped[str | None] = mapped_column(String(100))  # texto: preserva zeros à esquerda
     equipment_type: Mapped[str | None] = mapped_column(String(20), index=True)
+    brand: Mapped[str | None] = mapped_column(String(120))
+    model: Mapped[str | None] = mapped_column(String(120))
     accessories: Mapped[str | None] = mapped_column(Text)
     physical_condition: Mapped[str | None] = mapped_column(Text)
     reported_fault: Mapped[str] = mapped_column(Text)
@@ -159,6 +161,36 @@ class Guarantee(Timestamped):
     status: Mapped[str] = mapped_column(String(30), default='ativa', index=True)
     conditions: Mapped[str | None] = mapped_column(Text)
     notes: Mapped[str | None] = mapped_column(Text)
+    origin: Mapped[str | None] = mapped_column(String(20), index=True)  # ordem_servico | venda | manual
+    sale_id: Mapped[int | None] = mapped_column(ForeignKey('sales.id'), index=True)
+    equipment_type: Mapped[str | None] = mapped_column(String(20))
+    brand: Mapped[str | None] = mapped_column(String(120))
+    model: Mapped[str | None] = mapped_column(String(120))
+    serial: Mapped[str | None] = mapped_column(String(100))
+    quantity: Mapped[int | None] = mapped_column(Integer)
+    purchased_on: Mapped[date | None] = mapped_column(Date)
+    service_performed: Mapped[str | None] = mapped_column(Text)
+
+class GuaranteeAttachment(Timestamped):
+    """Documento digitalizado da garantia (contrato, páginas, assinaturas). Arquivo em documentos/garantias/."""
+    __tablename__ = 'guarantee_attachments'
+    guarantee_id: Mapped[int] = mapped_column(ForeignKey('guarantees.id'), index=True)
+    kind: Mapped[str] = mapped_column(String(20), default='documento')  # contrato | assinatura | documento
+    original_name: Mapped[str] = mapped_column(String(255))
+    relative_path: Mapped[str] = mapped_column(String(300), unique=True)
+    content_type: Mapped[str] = mapped_column(String(40))
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    sha256: Mapped[str] = mapped_column(String(64))
+
+class FinanceReceipt(Timestamped):
+    """Comprovante (PDF/JPG/PNG) de um lançamento financeiro. Arquivo em documentos/financeiro/comprovantes/."""
+    __tablename__ = 'finance_receipts'
+    financial_entry_id: Mapped[int] = mapped_column(ForeignKey('financial_entries.id'), index=True)
+    original_name: Mapped[str] = mapped_column(String(255))
+    relative_path: Mapped[str] = mapped_column(String(300), unique=True)
+    content_type: Mapped[str] = mapped_column(String(40))
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    sha256: Mapped[str] = mapped_column(String(64))
 
 class GuaranteeOccurrence(Timestamped):
     __tablename__ = 'guarantee_occurrences'
@@ -168,6 +200,19 @@ class GuaranteeOccurrence(Timestamped):
     resolution: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(30), default='aberta')
     closed_on: Mapped[date | None] = mapped_column(Date)
+
+class SaleReturn(Timestamped):
+    """Devolução FÍSICA de item vendido. `restocked` indica se a unidade voltou ao estoque disponível."""
+    __tablename__ = 'sale_returns'
+    sale_id: Mapped[int] = mapped_column(ForeignKey('sales.id', ondelete='CASCADE'), index=True)
+    sale_item_id: Mapped[int] = mapped_column(ForeignKey('sale_items.id', ondelete='CASCADE'), index=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey('products.id'), index=True)
+    quantity: Mapped[int] = mapped_column(Integer)
+    condition: Mapped[str] = mapped_column(String(20))  # 'revendavel' | 'danificado'
+    restocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    request_key: Mapped[str | None] = mapped_column(String(180), unique=True, index=True)
+    notes: Mapped[str | None] = mapped_column(Text)
+    __table_args__ = (CheckConstraint('quantity > 0', name='ck_sale_return_positive_quantity'),)
 
 class Counter(Timestamped):
     """Contadores persistentes (nunca reutilizam números já emitidos)."""

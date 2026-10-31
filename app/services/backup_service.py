@@ -23,6 +23,8 @@ DOCUMENTS_PREFIX = "documents/"
 # Tabelas cujos registros apontam para arquivos em DATA_DIR/documentos: (tabela, função -> caminho relativo).
 FILE_REFERENCES = (
     ("service_order_photos", lambda r: f"ordens-servico/{int(r['service_order_id'])}/{r['stored_name']}"),
+    ("guarantee_attachments", lambda r: r["relative_path"]),
+    ("finance_receipts", lambda r: r["relative_path"]),
 )
 SETTINGS_PATH = DATA_DIR / "backup_settings.json"
 STATUS_PATH = DATA_DIR / "backup_status.json"

@@ -16,11 +16,13 @@ from sqlalchemy import or_, func, inspect
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from openpyxl import load_workbook, Workbook
 from .database import Base, engine, get_db, DATA_DIR, BACKUP_DIR, IMPORT_BACKUP_DIR, DB_PATH, JSON_DB_PATH, SessionLocal, DATA_LOCK, _backup_path_notice, initialize_json_database, acquire_data_lock, release_data_lock, DatabaseBusyError, release_data_lock, DatabaseBusyError, SLOW_LOCK_SECONDS
-from .models import Product, Movement, Customer, Supplier, BankAccount, AccountBalanceAdjustment, AppUser, BankTransaction, ServiceOrder, Order, OrderItem, PurchaseReceipt, ServiceOrderPhoto, Guarantee, GuaranteeOccurrence, FinancialEntry, ImportLog, Sale, SaleItem, ServicePart, ServiceOrderEvent
+from .models import SaleReturn, Counter, Product, Movement, Customer, Supplier, BankAccount, AccountBalanceAdjustment, AppUser, BankTransaction, ServiceOrder, Order, OrderItem, PurchaseReceipt, ServiceOrderPhoto, Guarantee, GuaranteeOccurrence, FinancialEntry, ImportLog, Sale, SaleItem, ServicePart, ServiceOrderEvent
 from .services import backup_service
 from . import security, authorization, guarantees as guarantee_rules
 from .validation import normalize_phone, normalize_cpf, normalize_serial
-from . import customers as customer_rules
+from . import customers as customer_rules, storage
+from .contract import contract_html
+from .files_routes import router as files_router
 
 _instance_lock_handle=None
 
@@ -90,6 +92,7 @@ async def lifespan(app):
             db.add(BankAccount(name='Conta da Assistência',business_unit='Assistência',provider='InfinitePay',opening_balance=0,notes='Conta de controle local. Preencha o saldo inicial real antes de usar o saldo calculado.'))
             db.commit()
         customer_rules.assign_missing_public_seq(db)
+        storage.ensure_layout()
         admin=db.query(AppUser).filter(AppUser.is_admin==True,AppUser.active==True).order_by(AppUser.id).first()
         if admin:
             try: recovery_code=security.RECOVERY_CODE_PATH.read_text(encoding='utf-8').strip()
@@ -132,6 +135,7 @@ async def lifespan(app):
     _release_instance_lock()
 
 app = FastAPI(title='LMF Control', version='1.0.0', lifespan=lifespan)
+app.include_router(files_router)
 app.mount('/static', StaticFiles(directory=Path(__file__).parent / 'static'), name='static')
 
 AUTH_PUBLIC_PATHS={'/api/auth/status','/api/auth/setup','/api/auth/login','/api/auth/forgot-password'}
@@ -318,7 +322,7 @@ class SupplierInput(SupplierIn):
 class ServiceIn(BaseModel):
     model_config=ConfigDict(from_attributes=True)
     id:int|None=None; number:str|None=None
-    customer_id:int; equipment:str=Field(min_length=1); serial:str|None=None; equipment_type:str|None=None; reported_fault:str=Field(min_length=1); diagnosis:str|None=None
+    customer_id:int; equipment:str=Field(min_length=1); serial:str|None=None; equipment_type:str|None=None; brand:str|None=None; model:str|None=None; reported_fault:str=Field(min_length=1); diagnosis:str|None=None
     status:str='Recebido'; estimate:float=Field(default=0,ge=0); cost:float=Field(default=0,ge=0); charged:float=Field(default=0,ge=0); approval:str='Pendente'; entered_on:date=Field(default_factory=date.today); due_on:date|None=None; delivered_on:date|None=None; completed_on:date|None=None; accessories:str|None=None; physical_condition:str|None=None; service_executed:str|None=None; notes:str|None=None
 class NewCustomerData(BaseModel):
     name:str|None=None; document:str|None=None; phone:str|None=None; whatsapp:str|None=None; email:str|None=None
@@ -349,8 +353,14 @@ class GuaranteeIn(BaseModel):
     model_config=ConfigDict(from_attributes=True)
     id:int|None=None
     customer_id:int; service_order_id:int|None=None; item:str=Field(min_length=1); guarantee_type:str='serviço'; starts_on:date; ends_on:date; duration_days:int|None=None; status:str='ativa'; conditions:str|None=None; notes:str|None=None
+    origin:str|None=None; sale_id:int|None=None; equipment_type:str|None=None; brand:str|None=None; model:str|None=None; serial:str|None=None; quantity:int|None=None; purchased_on:date|None=None; service_performed:str|None=None
 class GuaranteeInput(GuaranteeIn):
-    ends_on:date|None=None  # o vencimento é calculado pelo servidor (início + 90 dias)
+    """Entrada: a origem (OS/venda) define o preenchimento automático; vencimento = início + prazo (padrão 90 dias), calculado no servidor."""
+    origin:Literal['ordem_servico','venda','manual']='manual'
+    customer_id:int|None=None; item:str|None=None; starts_on:date|None=None; ends_on:date|None=None
+    duration_days:int|None=Field(default=None,ge=1,le=3650)
+    sale_item_id:int|None=None
+    status:Literal['ativa','cancelada','expirada']='ativa'
 class GuaranteeOccurrenceIn(BaseModel):
     issue:str=Field(min_length=2); resolution:str|None=None; status:Literal['aberta','em análise','resolvida']='aberta'
 class FinanceIn(BaseModel):
@@ -424,6 +434,26 @@ def crud_routes(path, model, schema, searchable=(), input_schema=None, delete_gu
     app.delete(f'/api/{path}/{{item_id}}')(delete)
 
 crud_routes('products',Product,ProductIn,('sku','internal_code','name','category','supplier','brand','model','notes'))
+@app.get('/api/products/summary')
+def products_summary(db:Session=Depends(get_db)):
+    active=db.query(Product).filter(Product.active==True)
+    return {'products':active.count(),'units':db.query(func.coalesce(func.sum(Product.quantity),0)).filter(Product.active==True).scalar(),'low_stock':active.filter(Product.quantity<=Product.min_quantity).count()}
+
+@app.get('/api/search')
+def global_search(q:str='',db:Session=Depends(get_db)):
+    """Pesquisa global: consulta os dados reais de cada módulo e devolve os resultados agrupados por categoria."""
+    text=(q or '').strip()
+    if len(text)<2: return {'q':text,'groups':[]}
+    like=f'%{text}%'; limit=8; groups=[]
+    def add(category,module,path,rows,title,subtitle):
+        if rows: groups.append({'category':category,'module':module,'path':path,'items':[{'id':r.id,'title':title(r),'subtitle':subtitle(r)} for r in rows]})
+    add('Estoque','Estoque','products',db.query(Product).filter(or_(Product.name.ilike(like),Product.sku.ilike(like),Product.internal_code.ilike(like),Product.brand.ilike(like),Product.model.ilike(like))).order_by(Product.name).limit(limit).all(),lambda r:r.name,lambda r:f'SKU {r.sku} · {r.quantity} un.')
+    add('Fornecedores','Fornecedores','suppliers',db.query(Supplier).filter(or_(Supplier.name.ilike(like),Supplier.categories.ilike(like),Supplier.contact.ilike(like))).order_by(Supplier.name).limit(limit).all(),lambda r:r.name,lambda r:r.categories or r.contact or '')
+    add('Pedidos','Pedidos e encomendas','orders',db.query(Order).filter(or_(Order.number.ilike(like),Order.description.ilike(like))).order_by(Order.id.desc()).limit(limit).all(),lambda r:r.number,lambda r:f'{r.description} · {r.status}')
+    add('Ordens de serviço','Ordens de serviço','service-orders',db.query(ServiceOrder).outerjoin(Customer,ServiceOrder.customer_id==Customer.id).filter(or_(ServiceOrder.number.ilike(like),ServiceOrder.equipment.ilike(like),ServiceOrder.serial.ilike(like),ServiceOrder.equipment_type.ilike(like),ServiceOrder.reported_fault.ilike(like),Customer.name.ilike(like),Customer.document.ilike(like))).order_by(ServiceOrder.id.desc()).limit(limit).all(),lambda r:r.number,lambda r:f'{r.equipment_type or ""} {r.equipment} · {r.status}'.strip())
+    add('Garantias','Garantias','guarantees',db.query(Guarantee).filter(or_(Guarantee.item.ilike(like),Guarantee.conditions.ilike(like),Guarantee.notes.ilike(like))).order_by(Guarantee.id.desc()).limit(limit).all(),lambda r:r.item,lambda r:f'{r.status} · vence {r.ends_on}')
+    return {'q':text,'groups':groups}
+
 @app.get('/api/customers/lookup')
 def lookup_customer(document:str,db:Session=Depends(get_db)):
     try: cpf=normalize_cpf(document)
@@ -434,6 +464,49 @@ def lookup_customer(document:str,db:Session=Depends(get_db)):
 crud_routes('customers',Customer,CustomerIn,('name','phone','document','email'),input_schema=CustomerInput,prepare=customer_rules.prepare_customer)
 crud_routes('suppliers',Supplier,SupplierIn,('name','categories','contact','phone','whatsapp','email','website','notes'),input_schema=SupplierInput)
 crud_routes('orders',Order,OrderIn,('number','description','status'))
+@app.get('/api/guarantees',response_model=list[GuaranteeIn])
+def list_guarantees(q:str|None=None,scope:Literal['ativas','expiradas','todas']='ativas',db:Session=Depends(get_db)):
+    """Listagem principal = só garantias ATIVAS. As expiradas ficam preservadas e aparecem com scope=expiradas (histórico)."""
+    guarantee_rules.expire_due_guarantees(db)
+    query=db.query(Guarantee)
+    if scope=='ativas': query=query.filter(Guarantee.status=='ativa')
+    elif scope=='expiradas': query=query.filter(Guarantee.status=='expirada')
+    if q: query=query.filter(or_(Guarantee.item.ilike(f'%{q}%'),Guarantee.conditions.ilike(f'%{q}%'),Guarantee.serial.ilike(f'%{q}%'),Guarantee.brand.ilike(f'%{q}%'),Guarantee.model.ilike(f'%{q}%')))
+    return query.order_by(Guarantee.id.desc()).limit(500).all()
+
+@app.get('/api/guarantees/prefill')
+def guarantee_prefill(origin:Literal['ordem_servico','venda'],ref:str,sale_item_id:int|None=None,db:Session=Depends(get_db)):
+    """Pré-visualiza os dados que serão preenchidos a partir da OS (nº ou id) ou da venda (nº ou id). Somente leitura."""
+    if origin=='ordem_servico':
+        order=db.query(ServiceOrder).filter(ServiceOrder.number==ref).first() or (db.get(ServiceOrder,int(ref)) if ref.isdigit() else None)
+        if not order: raise HTTPException(404,'Ordem de serviço não encontrada.')
+        values=guarantee_rules.resolve_origin(db,{'origin':origin,'service_order_id':order.id})
+    else:
+        sale=db.query(Sale).filter(Sale.number==ref).first() or (db.get(Sale,int(ref)) if ref.isdigit() else None)
+        if not sale: raise HTTPException(404,'Venda não encontrada.')
+        lines=db.query(SaleItem).filter_by(sale_id=sale.id).order_by(SaleItem.id).all()
+        out=[]
+        for line in lines:
+            product=db.get(Product,line.product_id)
+            out.append({'sale_item_id':line.id,'product':product.name if product else f'Produto {line.product_id}','quantity':line.quantity})
+        if len(lines)!=1 and not sale_item_id: return {'origin':origin,'sale_id':sale.id,'sale_number':sale.number,'needs_item_choice':True,'items':out}
+        values=guarantee_rules.resolve_origin(db,{'origin':origin,'sale_id':sale.id,'sale_item_id':sale_item_id})
+    customer=db.get(Customer,values['customer_id'])
+    start=values['starts_on']; days=guarantee_rules.GUARANTEE_DAYS
+    return {**{k:(v.isoformat() if isinstance(v,date) else v) for k,v in values.items()},'customer_name':customer.name if customer else None,'customer_code':customer_rules.public_code(customer.public_seq) if customer else None,'duration_days':days,'ends_on':(start+timedelta(days=days)).isoformat()}
+
+CONTRACT_PATH=Path(__file__).parent/'assets'/'CONTRATO_DE_GARANTIA-SEGURO.docx'
+@app.get('/api/guarantees/contract/file')
+def contract_file():
+    if not CONTRACT_PATH.is_file(): raise HTTPException(404,'Contrato de garantia não encontrado no projeto.')
+    return FileResponse(CONTRACT_PATH,filename=CONTRACT_PATH.name,media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+
+@app.get('/api/guarantees/contract/view',response_class=HTMLResponse)
+def contract_view():
+    """Visualização (e impressão pelo navegador) do contrato, renderizada a partir do .docx original sem alterá-lo."""
+    if not CONTRACT_PATH.is_file(): raise HTTPException(404,'Contrato de garantia não encontrado no projeto.')
+    return HTMLResponse(contract_html(CONTRACT_PATH))
+
 crud_routes('guarantees',Guarantee,GuaranteeIn,('item','conditions'),input_schema=GuaranteeInput,prepare=guarantee_rules.prepare_guarantee,before_list=guarantee_rules.expire_due_guarantees)
 crud_routes('finance',FinancialEntry,FinanceIn,('description','category','kind','status','reference','payment_method','external_id'),delete_guard=lambda db,request,item_id:authorization.require_authorization(db,request,'financeiro.lancamento.excluir',item_id))
 
@@ -561,17 +634,54 @@ def cancel_sale(sale_id:int,request:Request,db:Session=Depends(get_db)):
     authorization.require_authorization(db,request,'financeiro.venda.cancelar',sale_id)
     if sale.status=='cancelada': return {'status':'cancelada','duplicate_request':True}
     try:
-        if sale.status=='confirmada':
-            items=db.query(SaleItem).filter_by(sale_id=sale.id).order_by(SaleItem.id).all()
-            for index,item in enumerate(items,1):
-                product=db.query(Product).filter_by(id=item.product_id).with_for_update().first()
-                if product:
-                    product.quantity+=item.quantity
-                    db.add(Movement(product_id=product.id,kind='entrada',quantity=item.quantity,reason=f'Estorno da venda {sale.number}',reference=sale.number,source_key=f'sale-cancel:{sale.id}:line:{index}'))
+        # Cancelar é um ato FINANCEIRO: o estoque só volta quando o retorno físico for confirmado (POST /api/sales/{id}/return).
         if sale.received_amount>0 and not db.query(FinancialEntry).filter_by(external_id=f'sale-refund:{sale.id}').first():
             db.add(FinancialEntry(kind='despesa',category='Estorno de venda',description=f'Estorno da venda {sale.number}',amount=sale.received_amount,status='pago',competence_on=date.today(),due_on=date.today(),paid_on=date.today(),payment_method=sale.payment_method,bank_account_id=sale.bank_account_id,customer_id=sale.customer_id,sale_id=sale.id,external_id=f'sale-refund:{sale.id}',reference=f'SALE:{sale.number}:refund'))
-        sale.status='cancelada'; db.commit(); return {'status':'cancelada','refunded':sale.received_amount}
+        sale.status='cancelada'; db.commit(); return {'status':'cancelada','refunded':sale.received_amount,'stock_returned':False}
     except Exception as e: db.rollback(); raise HTTPException(409,f'Falha ao cancelar venda: {e}')
+
+class SaleReturnLine(BaseModel):
+    sale_item_id:int; quantity:int=Field(gt=0); condition:Literal['revendavel','danificado']
+class SaleReturnIn(BaseModel):
+    items:list[SaleReturnLine]=Field(min_length=1); notes:str|None=None; request_key:str|None=None
+
+@app.get('/api/sales/{sale_id}/returns')
+def list_sale_returns(sale_id:int,db:Session=Depends(get_db)):
+    if not db.get(Sale,sale_id): raise HTTPException(404,'Venda não encontrada')
+    items=db.query(SaleItem).filter_by(sale_id=sale_id).order_by(SaleItem.id).all()
+    rows=db.query(SaleReturn).filter_by(sale_id=sale_id).order_by(SaleReturn.id).all()
+    return {'items':[{'sale_item_id':i.id,'product_id':i.product_id,'sold':i.quantity,'returned':sum(r.quantity for r in rows if r.sale_item_id==i.id)} for i in items],
+            'returns':[{'id':r.id,'sale_item_id':r.sale_item_id,'quantity':r.quantity,'condition':r.condition,'restocked':r.restocked,'notes':r.notes,'at':r.created_at.isoformat()} for r in rows]}
+
+@app.post('/api/sales/{sale_id}/return')
+def return_sale_items(sale_id:int,payload:SaleReturnIn,idempotency_key:str|None=Header(default=None,alias='Idempotency-Key'),db:Session=Depends(get_db)):
+    """Registra a devolução FÍSICA. Item revendável volta ao estoque; danificado é só registrado (não volta)."""
+    key=idempotency_key or payload.request_key
+    if key and db.query(SaleReturn).filter(SaleReturn.request_key.like(f'{key}#%')).first(): return {'sale_id':sale_id,'duplicate_request':True}
+    sale=db.query(Sale).filter_by(id=sale_id).with_for_update().first()
+    if not sale: raise HTTPException(404,'Venda não encontrada')
+    if sale.status not in ('confirmada','cancelada'): raise HTTPException(409,'Só há devolução de venda que saiu do estoque (confirmada ou cancelada).')
+    try:
+        wanted={}
+        for line in payload.items: wanted[line.sale_item_id]=wanted.get(line.sale_item_id,0)+line.quantity
+        for item_id,qty in wanted.items():
+            item=db.get(SaleItem,item_id)
+            if not item or item.sale_id!=sale_id: raise HTTPException(400,f'Item {item_id} não pertence a esta venda')
+            done=sum(r.quantity for r in db.query(SaleReturn).filter_by(sale_item_id=item_id).all())
+            if done+qty>item.quantity: raise HTTPException(409,f'Devolução maior que a vendida (vendido {item.quantity}, já devolvido {done}).')
+        result=[]
+        for index,line in enumerate(payload.items,1):
+            item=db.get(SaleItem,line.sale_item_id); restock=line.condition=='revendavel'
+            db.add(SaleReturn(sale_id=sale_id,sale_item_id=item.id,product_id=item.product_id,quantity=line.quantity,condition=line.condition,restocked=restock,request_key=f'{key}#{index}' if key else None,notes=payload.notes)); db.flush()
+            if restock:
+                product=db.query(Product).filter_by(id=item.product_id).with_for_update().first()
+                if product:
+                    product.quantity+=line.quantity
+                    db.add(Movement(product_id=product.id,kind='entrada',quantity=line.quantity,reason=f'Devolução física da venda {sale.number}',reference=sale.number,source_key=f'sale-return:{sale_id}:{item.id}:{db.query(SaleReturn).filter_by(sale_item_id=item.id).count()}:{index}'))
+            result.append({'sale_item_id':item.id,'quantity':line.quantity,'condition':line.condition,'restocked':restock})
+        db.commit(); return {'sale_id':sale_id,'returned':result}
+    except HTTPException: db.rollback(); raise
+    except Exception as e: db.rollback(); raise HTTPException(409,f'Devolução não registrada: {e}')
 
 @app.put('/api/sales/{sale_id}')
 def update_sale(sale_id:int,payload:SaleEditIn,db:Session=Depends(get_db)):
@@ -594,15 +704,18 @@ def delete_sale(sale_id:int,request:Request,confirm:bool=Query(False),db:Session
         if sale.status=='confirmada':
             for index,item in enumerate(items,1):
                 product=db.get(Product,item.product_id)
-                if product:
-                    product.quantity+=item.quantity
-                    db.add(Movement(product_id=product.id,kind='entrada',quantity=item.quantity,reason=f'Ajuste administrativo pela exclusão da venda {sale.number}',reference=sale.number,source_key=f'sale-delete:{sale.id}:line:{index}'))
+                already=sum(r.quantity for r in db.query(SaleReturn).filter_by(sale_item_id=item.id,restocked=True).all())
+                pending_qty=item.quantity-already
+                if product and pending_qty>0:
+                    product.quantity+=pending_qty
+                    db.add(Movement(product_id=product.id,kind='entrada',quantity=pending_qty,reason=f'Ajuste administrativo pela exclusão da venda {sale.number}',reference=sale.number,source_key=f'sale-delete:{sale.id}:line:{index}'))
         linked_entries=db.query(FinancialEntry).filter_by(sale_id=sale_id).all()
         linked_ids=[entry.id for entry in linked_entries]
         if linked_ids:
             db.query(BankTransaction).filter(BankTransaction.financial_entry_id.in_(linked_ids)).update({BankTransaction.financial_entry_id:None},synchronize_session=False)
             for entry in linked_entries: db.delete(entry)
         db.query(Movement).filter(Movement.reference==sale.number).delete(synchronize_session=False)
+        db.query(SaleReturn).filter(SaleReturn.sale_id==sale_id).delete(synchronize_session=False)
         for item in items: db.delete(item)
         db.delete(sale); db.commit(); return {'deleted':True,'id':sale_id,'stock_restored':sale.status=='confirmada'}
     except Exception as error:
@@ -665,7 +778,7 @@ def dashboard(db:Session=Depends(get_db)):
     for order in pending:
         relation=db.get(Customer,order.customer_id) if order.customer_id else (db.get(Supplier,order.supplier_id) if order.supplier_id else None)
         pending_rows.append({'number':order.number,'party':relation.name if relation else '—','description':order.description,'due_on':order.due_on.isoformat() if order.due_on else '—','status':order.status})
-    return {'products':db.query(Product).filter(Product.active==True).count(),'low_stock':db.query(Product).filter(Product.quantity<=Product.min_quantity,Product.active==True).count(),
+    return {'products':db.query(Product).filter(Product.active==True).count(),'stock_units':db.query(func.coalesce(func.sum(Product.quantity),0)).filter(Product.active==True).scalar(),'active_guarantees':db.query(Guarantee).filter(Guarantee.status=='ativa',Guarantee.ends_on>=today).count(),'low_stock':db.query(Product).filter(Product.quantity<=Product.min_quantity,Product.active==True).count(),
       'stock_cost':db.query(func.sum(Product.quantity*Product.cost)).scalar() or 0,'service_in_progress':db.query(ServiceOrder).filter(ServiceOrder.status.notin_(['Entregue','Cancelado'])).count(),
       'awaiting_approval':db.query(ServiceOrder).filter(ServiceOrder.status=='Aguardando aprovação').count(),'orders_pending':db.query(Order).filter(Order.status.notin_(['Concluído','Cancelado'])).count(),
       'orders_late':db.query(Order).filter(Order.due_on<today,Order.status.notin_(['Concluído','Cancelado'])).count(),'guarantees_expiring':db.query(Guarantee).filter(Guarantee.ends_on>=today,Guarantee.ends_on<=date.fromordinal(today.toordinal()+30)).count(),

@@ -223,7 +223,7 @@ def test_sale_stock_finance_report_and_imported_backup():
         assert c.get('/api/products').json()[0]['quantity']==2
         canceled=c.post(f"/api/sales/{sale.json()['id']}/cancel",headers=authorize(c,'financeiro.venda.cancelar',sale.json()['id']))
         assert canceled.status_code==200 and canceled.json()['refunded']==25
-        assert c.get('/api/products').json()[0]['quantity']==4
+        assert c.get('/api/products').json()[0]['quantity']==2  # cancelar NÃO devolve estoque sem retorno físico
         assert c.post(f"/api/sales/{sale.json()['id']}/cancel",headers=authorize(c,'financeiro.venda.cancelar',sale.json()['id'])).json()['duplicate_request'] is True
         backup=c.post('/api/backups').json()['file']
         IMPORT_BACKUP_DIR.mkdir(parents=True,exist_ok=True)
