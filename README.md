@@ -110,3 +110,31 @@ A tela de venda registra um produto por operação; a API aceita vários itens. 
 - **Cliente dentro da OS**: informe o CPF; se existir, o cadastro é reaproveitado e preenchido (`GET /api/customers/lookup?document=`); senão é criado ao salvar a OS. A aba de clientes não é necessária.
 - **Identificador público do cliente** (`public_seq`, exibido 01, 02, ... 100): vem de um contador persistente (tabela `counters`), nunca reutiliza números de clientes excluídos, é gerado no servidor e não pode ser escolhido pelo cliente da API. Clientes antigos são numerados na ordem de cadastro ao iniciar.
 - **Migration** `20261031_0008` (aditiva: `customers.public_seq`, `service_orders.equipment_type`, tabela `counters`). Verificada em SQLite temporário; não foi aplicada no Supabase/PostgreSQL.
+
+
+## Etapas 2 a 7 do prompt mestre (vendas, garantias, arquivos, interface)
+
+### Pastas locais (`<DATA_DIR>/documentos`, incluída em todo backup)
+```
+ordens-servico/<id da OS>/             fotos da OS (até 6)
+garantias/<id da garantia>/            contrato digitalizado, páginas e assinaturas (JPG/JPEG/PNG, várias)
+financeiro/comprovantes/<id lanç.>/    comprovantes (PDF/JPG/PNG)
+financeiro/comprovantes/_removidos/    comprovantes removidos pelo usuário (arquivados, nunca apagados)
+fornecedores/  pedidos/  geral/        reservadas
+```
+Backups ficam em `LMF_BACKUP_DIR`. O banco guarda só o caminho relativo, o tipo, o tamanho e o SHA-256 (nunca uma URL pública); os arquivos são servidos por rotas autenticadas. Nomes `<tipo>_<data-hora>_<sha8>.<ext>` criados sem sobrescrever. O tipo é conferido pelo conteúdo, não pela extensão.
+
+### Regras de relacionamento
+- **Venda -> estoque:** venda confirmada baixa o estoque e grava a movimentação de saída, tudo na mesma transação; sem saldo, a venda é bloqueada (409); `Idempotency-Key` impede processar a mesma venda duas vezes.
+- **Cancelar venda** é só financeiro (estorno). O estoque só volta com `POST /api/sales/{id}/return` (devolução **física**): item `revendavel` volta ao estoque; `danificado` é registrado e **não** volta. Cada devolução é limitada ao vendido, é idempotente e fica em `sale_returns` (movimentação de retorno separada).
+- **Garantia** tem origem `ordem_servico`, `venda` ou `manual`. A OS/venda é só **consultada** para preencher (`GET /api/guarantees/prefill`); criar ou editar garantia nunca altera OS, venda ou estoque, e origem/vínculos não mudam depois de criada.
+- **Prazo:** 90 dias contados do início (ou o prazo registrado na garantia). Vencidas saem da lista principal (`?scope=ativas`, padrão) e ficam em `?scope=expiradas`/`todas`, com registro e anexos preservados. Nada é apagado automaticamente.
+- **Contrato:** `app/assets/CONTRATO_DE_GARANTIA-SEGURO.docx` (original, não é alterado): `/api/guarantees/contract/view` (visualizar/imprimir) e `/contract/file` (baixar).
+- **Comprovantes:** vários por lançamento; remover desfaz só o vínculo. **OCR não foi implementado** (não há tecnologia de OCR no projeto); os dados do comprovante devem ser conferidos e digitados pelo usuário.
+- **Pesquisa global:** `GET /api/search?q=` agrupa Estoque, Fornecedores, Pedidos, Ordens de serviço e Garantias, direto dos dados reais.
+
+### Migrations (aditivas, idempotentes, verificadas em SQLite temporário)
+`0008` (`customers.public_seq`, `counters`, `service_orders.equipment_type`), `0009` (`sale_returns`, colunas de origem em `guarantees`, `guarantee_attachments`, `finance_receipts`, `service_orders.brand/model`). **Não foram aplicadas no Supabase/PostgreSQL**: o JSON continua sendo o banco principal e o Supabase é só espelho (decisão B).
+
+### Interface
+Tema claro/escuro (preferência guardada, logos próprias por tema), menu lateral recolhível (preferência guardada), tabelas viram cartões no celular, formulários/modais em tela cheia no celular, painel inicial enxuto com pesquisa global.

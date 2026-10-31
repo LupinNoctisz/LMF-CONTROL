@@ -53,7 +53,7 @@ def contract_html(path: Path) -> str:
         ".bar{position:sticky;top:0;background:#fff;padding:8px 0;border-bottom:1px solid #ddd;margin-bottom:12px}"
         "button{padding:8px 14px;margin-right:8px;cursor:pointer}"
         "@media print{.bar{display:none}body{margin:0;max-width:none}}"
-        "</style></head><body><div class='bar'><button onclick='window.print()'>Imprimir</button>"
+        "</style></head><body onload=\"if(location.search.indexOf('print=1')>-1)window.print()\"><div class='bar'><button onclick='window.print()'>Imprimir</button>"
         "<a href='/api/guarantees/contract/file'><button type='button'>Baixar .docx</button></a></div>"
         + "".join(body) + "</body></html>"
     )

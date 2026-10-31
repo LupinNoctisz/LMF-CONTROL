@@ -475,7 +475,7 @@ def list_guarantees(q:str|None=None,scope:Literal['ativas','expiradas','todas']=
     return query.order_by(Guarantee.id.desc()).limit(500).all()
 
 @app.get('/api/guarantees/prefill')
-def guarantee_prefill(origin:Literal['ordem_servico','venda'],ref:str,db:Session=Depends(get_db)):
+def guarantee_prefill(origin:Literal['ordem_servico','venda'],ref:str,sale_item_id:int|None=None,db:Session=Depends(get_db)):
     """Pré-visualiza os dados que serão preenchidos a partir da OS (nº ou id) ou da venda (nº ou id). Somente leitura."""
     if origin=='ordem_servico':
         order=db.query(ServiceOrder).filter(ServiceOrder.number==ref).first() or (db.get(ServiceOrder,int(ref)) if ref.isdigit() else None)
@@ -489,8 +489,8 @@ def guarantee_prefill(origin:Literal['ordem_servico','venda'],ref:str,db:Session
         for line in lines:
             product=db.get(Product,line.product_id)
             out.append({'sale_item_id':line.id,'product':product.name if product else f'Produto {line.product_id}','quantity':line.quantity})
-        if len(lines)!=1: return {'origin':origin,'sale_id':sale.id,'sale_number':sale.number,'needs_item_choice':True,'items':out}
-        values=guarantee_rules.resolve_origin(db,{'origin':origin,'sale_id':sale.id})
+        if len(lines)!=1 and not sale_item_id: return {'origin':origin,'sale_id':sale.id,'sale_number':sale.number,'needs_item_choice':True,'items':out}
+        values=guarantee_rules.resolve_origin(db,{'origin':origin,'sale_id':sale.id,'sale_item_id':sale_item_id})
     customer=db.get(Customer,values['customer_id'])
     start=values['starts_on']; days=guarantee_rules.GUARANTEE_DAYS
     return {**{k:(v.isoformat() if isinstance(v,date) else v) for k,v in values.items()},'customer_name':customer.name if customer else None,'customer_code':customer_rules.public_code(customer.public_seq) if customer else None,'duration_days':days,'ends_on':(start+timedelta(days=days)).isoformat()}
@@ -778,7 +778,7 @@ def dashboard(db:Session=Depends(get_db)):
     for order in pending:
         relation=db.get(Customer,order.customer_id) if order.customer_id else (db.get(Supplier,order.supplier_id) if order.supplier_id else None)
         pending_rows.append({'number':order.number,'party':relation.name if relation else '—','description':order.description,'due_on':order.due_on.isoformat() if order.due_on else '—','status':order.status})
-    return {'products':db.query(Product).filter(Product.active==True).count(),'stock_units':db.query(func.coalesce(func.sum(Product.quantity),0)).filter(Product.active==True).scalar(),'low_stock':db.query(Product).filter(Product.quantity<=Product.min_quantity,Product.active==True).count(),
+    return {'products':db.query(Product).filter(Product.active==True).count(),'stock_units':db.query(func.coalesce(func.sum(Product.quantity),0)).filter(Product.active==True).scalar(),'active_guarantees':db.query(Guarantee).filter(Guarantee.status=='ativa',Guarantee.ends_on>=today).count(),'low_stock':db.query(Product).filter(Product.quantity<=Product.min_quantity,Product.active==True).count(),
       'stock_cost':db.query(func.sum(Product.quantity*Product.cost)).scalar() or 0,'service_in_progress':db.query(ServiceOrder).filter(ServiceOrder.status.notin_(['Entregue','Cancelado'])).count(),
       'awaiting_approval':db.query(ServiceOrder).filter(ServiceOrder.status=='Aguardando aprovação').count(),'orders_pending':db.query(Order).filter(Order.status.notin_(['Concluído','Cancelado'])).count(),
       'orders_late':db.query(Order).filter(Order.due_on<today,Order.status.notin_(['Concluído','Cancelado'])).count(),'guarantees_expiring':db.query(Guarantee).filter(Guarantee.ends_on>=today,Guarantee.ends_on<=date.fromordinal(today.toordinal()+30)).count(),
