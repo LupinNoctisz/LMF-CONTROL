@@ -48,7 +48,7 @@ def test_due_date_is_start_plus_90_days_recorded_at_creation(client, customer):
     g = make(client, customer, start)
     assert g['ends_on'] == str(start + timedelta(days=90)) == '2026-05-30'
     assert g['duration_days'] == 90
-    stored = client.get('/api/guarantees').json()
+    stored = client.get('/api/guarantees', params={'scope': 'todas'}).json()
     assert next(x for x in stored if x['id'] == g['id'])['ends_on'] == '2026-05-30'
 
 
@@ -61,14 +61,20 @@ def test_counted_from_start_date_not_from_registration_date(client, customer):
 
 def test_client_supplied_due_date_is_ignored(client, customer):
     start = date.today()
-    g = make(client, customer, start, ends_on=str(start + timedelta(days=3650)), duration_days=3650)
+    g = make(client, customer, start, ends_on=str(start + timedelta(days=3650)))
     assert g['ends_on'] == str(start + timedelta(days=90)) and g['duration_days'] == 90
+
+
+def test_custom_term_is_honored_when_registered_and_validated(client, customer):
+    g = make(client, customer, date.today(), duration_days=180)
+    assert g['duration_days'] == 180 and g['ends_on'] == str(date.today() + timedelta(days=180))
+    assert client.post('/api/guarantees', json={'customer_id': customer, 'item': 'x', 'starts_on': str(date.today()), 'duration_days': 0}).status_code == 422
 
 
 def test_update_without_changing_start_keeps_stored_due_date(client, customer):
     start = date.today()
     g = make(client, customer, start)
-    body = {**g, 'notes': 'obs', 'ends_on': '2099-01-01', 'duration_days': 5}
+    body = {**g, 'notes': 'obs', 'ends_on': '2099-01-01'}
     r = client.put(f"/api/guarantees/{g['id']}", json=body)
     assert r.status_code == 200
     assert r.json()['ends_on'] == g['ends_on'] and r.json()['duration_days'] == 90 and r.json()['notes'] == 'obs'
@@ -137,7 +143,7 @@ def test_listing_shows_expired_without_any_manual_action(client, customer):
     g = make(client, customer, date.today() - timedelta(days=10))
     with SessionLocal() as db:  # envelhece o registro direto no banco, como se os dias tivessem passado
         row = db.get(Guarantee, g['id']); row.ends_on = date.today() - timedelta(days=1); db.commit()
-    assert next(x for x in client.get('/api/guarantees').json() if x['id'] == g['id'])['status'] == 'expirada'
+    assert next(x for x in client.get('/api/guarantees', params={'scope': 'todas'}).json() if x['id'] == g['id'])['status'] == 'expirada'
 
 
 def test_background_task_expires_without_opening_any_page(customer_name='bg'):

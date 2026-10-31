@@ -130,3 +130,5 @@ textarea { width: 100%; min-height: 5rem; font: inherit; color: inherit; backgro
 .op-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .os-section { border: 1px solid var(--line, #d8dee9); border-radius: 8px; margin: 0 0 12px; padding: 8px 12px 12px; }
 .os-section legend { font-weight: 600; padding: 0 6px; }
+.home-search { display: flex; gap: 8px; margin: 0 0 16px; }
+.home-search input { flex: 1; min-width: 0; padding: 10px 12px; }
